@@ -49,6 +49,8 @@ pub struct UtreexoNodeConfig {
     /// is that we are vulnerable to a fraud proof attack for a few hours, but we can spot it
     /// and react in a couple of hours at most, so the attack window is very small.
     pub backfill: bool,
+    /// Managed historical verification status shared with the inherited control channel.
+    pub historical: Option<historical::Historical>,
     /// If we are using network-provided block filters, we may not need to download the whole
     /// chain of filters, as our wallets may not have been created at the beginning of the chain.
     /// With this option, we can make a rough estimate of the block height we need to start
@@ -79,6 +81,7 @@ impl Default for UtreexoNodeConfig {
             datadir: ".floresta-node".to_string(),
             proxy: None,
             backfill: false,
+            historical: None,
             assume_utreexo: None,
             filter_start_height: None,
             user_agent: format!("floresta:{}", env!("CARGO_PKG_VERSION")),
@@ -90,6 +93,7 @@ impl Default for UtreexoNodeConfig {
 pub mod address_man;
 pub mod block_proof;
 pub mod error;
+pub mod historical;
 pub mod node;
 pub mod node_context;
 pub mod node_interface;

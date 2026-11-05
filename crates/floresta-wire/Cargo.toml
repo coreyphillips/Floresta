@@ -19,6 +19,7 @@ bip324 = { version = "0.10", features = [ "tokio" ] }
 bitcoin = { workspace = true }
 dns-lookup = { workspace = true }
 rand = { workspace = true }
+tempfile = { workspace = true }
 rustls = "=0.23.27"
 rustreexo = { workspace = true }
 serde = { workspace = true }

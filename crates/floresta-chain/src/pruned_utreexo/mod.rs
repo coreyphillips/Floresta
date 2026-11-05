@@ -158,6 +158,11 @@ pub trait UpdatableChainstate {
     fn handle_transaction(&self) -> Result<(), BlockchainError>;
     /// Persists our data. Should be invoked periodically.
     fn flush(&self) -> Result<(), BlockchainError>;
+    /// First historical validation failure, if this backend is replaying a partial chain.
+    fn replay_failure(&self) -> Option<String> {
+        None
+    }
+
     /// Toggle IBD on/off
     fn toggle_ibd(&self, is_ibd: bool);
     /// Tells this blockchain to consider this block invalid, and not build on top of it

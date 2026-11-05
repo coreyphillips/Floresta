@@ -1220,11 +1220,23 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
     }
 
     fn mark_block_as_valid(&self, block: BlockHash) -> Result<(), BlockchainError> {
-        let header = self.get_disk_block_header(&block)?;
+        // The foreground may have moved while a replay was running. Validate and promote
+        // under the same lock so a detached block cannot overwrite the active height.
+        let mut inner = write_lock!(self);
+        let header = inner
+            .chainstore
+            .get_header(&block)?
+            .ok_or(BlockchainError::BlockNotPresent)?;
         let height = header.try_height()?;
-
-        let new_header = DiskBlockHeader::FullyValid(*header, height);
-        self.update_header(&new_header)
+        if inner.chainstore.get_block_hash(height)? != Some(block) {
+            return Err(BlockchainError::OrphanOrInvalidBlock);
+        }
+        if matches!(header, DiskBlockHeader::FullyValid(_, _)) {
+            return Ok(());
+        }
+        Ok(inner
+            .chainstore
+            .save_header(&DiskBlockHeader::FullyValid(*header, height))?)
     }
 
     fn mark_chain_as_assumed(
@@ -1232,7 +1244,8 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         acc: Stump,
         assumed_hash: BlockHash,
     ) -> Result<bool, BlockchainError> {
-        let mut curr_header = self.get_disk_block_header(&assumed_hash)?;
+        let anchor = self.get_disk_block_header(&assumed_hash)?;
+        let mut curr_header = anchor;
 
         while let Ok(header) = self.get_disk_block_header(&curr_header.block_hash()) {
             if self.is_genesis(&header) {
@@ -1244,11 +1257,9 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             curr_header = self.get_ancestor(&header)?;
         }
 
-        self.update_view(curr_header.try_height()?, &curr_header, acc.clone())?;
-
-        let mut guard = write_lock!(self);
-        guard.best_block.validation_index = assumed_hash;
-        guard.acc = acc;
+        // Persist the assumed accumulator at its actual block, so startup can reload
+        // the same stump even if the node exits before the next block arrives.
+        self.update_view(anchor.try_height()?, &anchor, acc)?;
 
         Ok(true)
     }
@@ -1429,16 +1440,15 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         final_height: u32,
         acc: Stump,
     ) -> Result<super::partial_chain::PartialChainState, BlockchainError> {
+        if initial_height > final_height {
+            return Err(BlockchainError::BadValidationIndex);
+        }
         let blocks = (0..=final_height)
             .map(|height| {
-                let hash = self
-                    .get_block_hash(height)
-                    .expect("Block should be present");
-                *self
-                    .get_disk_block_header(&hash)
-                    .expect("Block should be present")
+                let hash = self.get_block_hash(height)?;
+                self.get_disk_block_header(&hash).map(|header| *header)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let inner = PartialChainStateInner {
             error: None,
@@ -1686,6 +1696,39 @@ mod test {
         while let Ok(header) = BlockHeader::consensus_decode(&mut buffer) {
             chain.accept_header(header).unwrap();
         }
+    }
+
+    #[test]
+    fn replay_preserves_persisted_stump_at_the_selected_block() {
+        let mut parsed = include_str!("../../testdata/blocks.txt")
+            .lines()
+            .map(|line| deserialize_hex::<Block>(line).unwrap());
+        let _genesis = parsed.next().unwrap();
+        let block = parsed.next().unwrap();
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled);
+        chain.accept_header(block.header).unwrap();
+        chain
+            .connect_block(&block, Proof::default(), HashMap::new(), Vec::new())
+            .unwrap();
+        let expected = chain.acc();
+        assert_ne!(expected, Stump::default());
+        chain.mark_block_as_valid(block.block_hash()).unwrap();
+        assert_eq!(
+            chain.get_roots_for_block(1).unwrap(),
+            Some(expected.clone())
+        );
+
+        let assumed = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled);
+        assumed.accept_header(block.header).unwrap();
+        assumed
+            .mark_chain_as_assumed(expected.clone(), block.block_hash())
+            .unwrap();
+        assert_eq!(assumed.get_validation_index().unwrap(), 1);
+        assert_eq!(assumed.get_roots_for_block(1).unwrap(), Some(expected));
+        assert_eq!(
+            assumed.get_roots_for_block(0).unwrap().unwrap_or_default(),
+            Stump::default()
+        );
     }
 
     #[test]

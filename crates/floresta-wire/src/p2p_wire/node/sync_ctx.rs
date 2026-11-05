@@ -35,7 +35,13 @@ use crate::p2p_wire::peer::PeerMessages;
 ///
 /// see [node_context](crates/floresta-wire/src/p2p_wire/node_context.rs) and [node.rs](crates/floresta-wire/src/p2p_wire/node.rs) for more information.
 #[derive(Clone, Debug, Default)]
-pub struct SyncNode {}
+pub struct SyncNode {
+    pub(crate) replay: Option<(
+        crate::p2p_wire::historical::Checkpoint,
+        crate::Historical,
+        u32,
+    )>,
+}
 
 impl NodeContext for SyncNode {
     /// Get the required [services](ServiceFlags) for the [`SyncNode`].
@@ -239,6 +245,34 @@ where
             .get_best_block()
             .expect("best block should present")
             .0;
+
+        if let Some((checkpoint, status, saved)) = &mut self.context.replay {
+            status.advance(validation_index);
+            if let Some(error) = self.common.chain.replay_failure() {
+                status.fail(&error);
+                return LoopControl::Break;
+            }
+            if validation_index.saturating_sub(*saved) >= 2016 && validation_index < best_block {
+                let result = self
+                    .common
+                    .chain
+                    .get_block_hash(validation_index)
+                    .map_err(|_| std::io::Error::other("Historical header unavailable"))
+                    .and_then(|hash| {
+                        checkpoint.store(
+                            validation_index,
+                            hash,
+                            &self.common.chain.get_acc(),
+                            false,
+                        )
+                    });
+                if let Err(error) = result {
+                    status.fail(&error.to_string());
+                    return LoopControl::Break;
+                }
+                *saved = validation_index;
+            }
+        }
 
         if validation_index == best_block {
             info!("IBD is finished, switching to normal operation mode");

@@ -181,6 +181,116 @@ where
         Ok(())
     }
 
+    /// Reconstruct the managed network anchor from genesis and execute historical scripts.
+    /// The full foreground validator continues above this boundary.
+    fn managed_backfill(
+        &self,
+        status: crate::Historical,
+        done: std::sync::mpsc::Sender<()>,
+    ) -> Result<bool, WireError> {
+        use crate::p2p_wire::historical::Checkpoint;
+        use floresta_chain::ChainParams;
+        use std::io;
+        use std::path::Path;
+
+        let mut anchor = ChainParams::get_assume_utreexo(self.config.network);
+        if anchor.height == 0 {
+            // No assumed interval on this network. On restart independently replay any
+            // already persisted prefix under the current verification policy.
+            let height = self.chain.get_validation_index()?;
+            let stump = self.chain.get_acc();
+            anchor.height = height;
+            anchor.block_hash = self.chain.get_block_hash(height)?;
+            anchor.leaves = stump.leaves;
+            anchor.roots = stump.roots;
+        }
+        if self.chain.get_block_hash(anchor.height)? != anchor.block_hash {
+            return Err(io::Error::other(
+                "Selected chain does not include the pinned historical anchor",
+            )
+            .into());
+        }
+
+        let checkpoint = Checkpoint::open(Path::new(&self.config.datadir), anchor.clone())?;
+        let (height, stump, complete) = checkpoint
+            .recover(|at| self.chain.get_block_hash(at).ok())
+            .unwrap_or_else(|error| {
+                warn!("Restarting historical validation from genesis: {error}");
+                (0, Stump::default(), false)
+            });
+        status.begin(height, &anchor);
+        if complete || anchor.height == 0 {
+            if anchor.height == 0 && !checkpoint.matches(&Stump::default()) {
+                return Err(io::Error::other("Genesis accumulator mismatch").into());
+            }
+            status.verified();
+            return Ok(false);
+        }
+
+        let chain = self.chain.get_partial_chain(height, anchor.height, stump)?;
+        let mut node = UtreexoNode::<PartialChainState, SyncNode>::new(
+            self.config.clone(),
+            chain,
+            self.mempool.clone(),
+            None,
+            self.kill_signal.clone(),
+            self.address_man.clone(),
+        )?;
+        node.context.replay = Some((checkpoint.clone(), status.clone(), height));
+        let outer = self.chain.clone();
+        let progress = status.clone();
+        let worker = tokio::spawn(async move {
+            let node = node.run(|_| {}).await;
+            let chain = &node.chain;
+            if let Some(error) = chain.replay_failure() {
+                return Err(io::Error::other(error));
+            }
+            if progress.failed() {
+                return Ok(());
+            }
+            let height = chain.get_validation_index().map_err(io::Error::other)?;
+            progress.advance(height);
+            let hash = chain.get_block_hash(height).map_err(io::Error::other)?;
+            let stump = chain.get_acc();
+            if height < anchor.height {
+                checkpoint.store(height, hash, &stump, false)?;
+                return Ok(());
+            }
+            if height != anchor.height
+                || hash != anchor.block_hash
+                || !checkpoint.matches(&stump)
+                || outer.get_block_hash(height).ok() != Some(hash)
+            {
+                return Err(io::Error::other(
+                    "Replayed accumulator or active header differs from the historical anchor",
+                ));
+            }
+            for block in chain.list_valid_blocks() {
+                outer
+                    .mark_block_as_valid(block.block_hash())
+                    .map_err(io::Error::other)?;
+            }
+            outer.flush().map_err(io::Error::other)?;
+            if outer.get_block_hash(height).ok() != Some(hash) {
+                return Err(io::Error::other(
+                    "Historical anchor changed while publishing verification",
+                ));
+            }
+            checkpoint.store(height, hash, &stump, true)?;
+            progress.verified();
+            Ok::<_, io::Error>(())
+        });
+        tokio::spawn(async move {
+            match worker.await {
+                Err(_) => status.fail("Historical verification worker exited unexpectedly"),
+                Ok(Err(error)) => status.fail(&error.to_string()),
+                Ok(Ok(())) => {}
+            }
+            let _ = done.send(());
+        });
+        Ok(true)
+    }
+
     /// If either PoW fraud proofs or assumeutreexo are enabled, we will "skip" IBD for all
     /// historical blocks. This allow us to start the node faster, making it usable in a few
     /// minutes. If you still want to validate all blocks, you can enable the backfill option.
@@ -314,8 +424,17 @@ where
         let is_backfilling = match self.config.backfill {
             true => {
                 info!("Starting backfill task...");
-                self.backfill(sender)
-                    .expect("Failed to spawn backfill thread")
+                match self.config.historical.clone() {
+                    Some(status) => self
+                        .managed_backfill(status.clone(), sender)
+                        .unwrap_or_else(|error| {
+                            status.fail(&error.to_string());
+                            false
+                        }),
+                    None => self
+                        .backfill(sender)
+                        .expect("Failed to spawn backfill thread"),
+                }
             }
             false => false,
         };
@@ -331,6 +450,9 @@ where
         };
 
         if *self.kill_signal.read().await {
+            if is_backfilling {
+                let _ = tokio::task::spawn_blocking(move || recv.recv()).await;
+            }
             self.shutdown();
             stop_signal.send(()).unwrap();
             return;
@@ -385,7 +507,7 @@ where
         // ignore the error here because if the backfill task already
         // finished, this channel will be closed
         if is_backfilling {
-            let _ = recv.recv();
+            let _ = tokio::task::spawn_blocking(move || recv.recv()).await;
         }
 
         self.shutdown();

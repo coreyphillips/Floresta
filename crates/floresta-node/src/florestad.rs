@@ -382,7 +382,11 @@ impl Florestad {
         let blockchain_state = Arc::new(Self::load_chain_state(
             data_dir.clone(),
             self.config.network,
-            self.config.assume_valid,
+            if self.config.managed_stdio {
+                AssumeValidArg::Disabled
+            } else {
+                self.config.assume_valid
+            },
         )?);
 
         #[cfg(feature = "compact-filters")]
@@ -418,7 +422,9 @@ impl Florestad {
             .map(|addr| Self::resolve_hostname(addr, 9050))
             .transpose()?;
 
+        let historical = self.config.managed_stdio.then(floresta_wire::Historical::default);
         let config = UtreexoNodeConfig {
+            historical: historical.clone(),
             disable_dns_seeds: self.config.disable_dns_seeds,
             network: self.config.network,
             pow_fraud_proofs: false,
@@ -426,8 +432,12 @@ impl Florestad {
             datadir: data_dir.clone(),
             fixed_peer: self.config.connect.clone(),
             compact_filters: self.config.cfilters,
-            assume_utreexo: self.config.assumeutreexo_value.clone().or(assume_utreexo),
-            backfill: self.config.backfill,
+            assume_utreexo: if self.config.managed_stdio {
+                Some(ChainParams::get_assume_utreexo(self.config.network))
+            } else {
+                self.config.assumeutreexo_value.clone().or(assume_utreexo)
+            },
+            backfill: self.config.managed_stdio || self.config.backfill,
             filter_start_height: self.config.filters_start_height,
             user_agent: self.config.user_agent.clone(),
             allow_v1_fallback: self.config.allow_v1_fallback,
@@ -534,6 +544,7 @@ impl Florestad {
                 self.stop_signal.clone(),
             )?;
             electrum_server.restrict_to_chain_health();
+            let historical = historical.expect("managed status constructed with managed config");
             let endpoint = non_tls_listener.local_addr()?;
             let chain = blockchain_state.clone();
             let network = self.config.network;
@@ -551,6 +562,7 @@ impl Florestad {
                     let status = serde_json::json!({
                         "protocol": "chicory.floresta/1", "watchProtocol": "chicory.watch/1",
                         "network": network.to_string(),
+                        "historical": historical.snapshot(height, validated, chain.is_in_ibd(), |at| chain.get_block_hash(at).ok()),
                         "endpoint": endpoint.to_string(), "genesis": genesis.to_string(),
                         "height": height, "tip": tip.to_string(), "validated": validated, "ibd": chain.is_in_ibd()
                     });
