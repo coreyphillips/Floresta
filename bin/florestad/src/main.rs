@@ -24,7 +24,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::io::IsTerminal;
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
@@ -173,16 +172,6 @@ fn main() {
 
     let signal = Arc::new(RwLock::new(false));
     let _signal = signal.clone();
-    if managed {
-        // EOF means the owner quit or crashed. Version 1 accepts no commands.
-        // Use a dedicated OS thread so an open pipe cannot stall Tokio shutdown.
-        let owner = signal.clone();
-        std::thread::spawn(move || {
-            let _ = io::stdin().lock().read_exact(&mut [0]);
-            *owner.blocking_write() = true;
-        });
-    }
-
     _rt.spawn(async move {
         // This is used to signal the runtime to stop gracefully.
         // It will be set to true when we receive a Ctrl-C or a stop signal.

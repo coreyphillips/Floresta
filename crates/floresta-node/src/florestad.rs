@@ -526,6 +526,13 @@ impl Florestad {
             .map_err(FlorestadError::FailedToBindElectrumServer)?;
 
         if self.config.managed_stdio {
+            crate::managed_watch::start(
+                data_dir,
+                self.config.network,
+                blockchain_state.clone(),
+                chain_provider.get_handle(),
+                self.stop_signal.clone(),
+            )?;
             electrum_server.restrict_to_chain_health();
             let endpoint = non_tls_listener.local_addr()?;
             let chain = blockchain_state.clone();
@@ -542,7 +549,8 @@ impl Florestad {
                         break;
                     };
                     let status = serde_json::json!({
-                        "protocol": "chicory.floresta/1", "network": network.to_string(),
+                        "protocol": "chicory.floresta/1", "watchProtocol": "chicory.watch/1",
+                        "network": network.to_string(),
                         "endpoint": endpoint.to_string(), "genesis": genesis.to_string(),
                         "height": height, "tip": tip.to_string(), "validated": validated, "ibd": chain.is_in_ibd()
                     });
