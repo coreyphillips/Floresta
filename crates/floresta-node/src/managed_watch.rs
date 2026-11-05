@@ -4,6 +4,7 @@
 //! No Electrum client can register a watch or read this index.
 
 mod confirmed;
+mod offer;
 mod pending;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -56,6 +57,8 @@ struct Command {
     query: Option<confirmed::Query>,
     #[serde(default)]
     pending: Option<pending::Query>,
+    #[serde(default)]
+    offer: Option<offer::Request>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -687,6 +690,7 @@ pub(crate) fn start<C: BlockchainInterface + Send + Sync + 'static>(
     pending::start(pending_pool, peer.clone(), network, chain.clone(), stop.clone())?;
     let control = registry.clone();
     let reader_chain = chain.clone();
+    let sender_peer = peer.clone();
     let owner_lifetime = stop.clone();
     std::thread::spawn(move || {
         let mut input = io::stdin().lock();
@@ -701,15 +705,21 @@ pub(crate) fn start<C: BlockchainInterface + Send + Sync + 'static>(
             {
                 break;
             }
-            let Ok(command) = serde_json::from_slice::<Command>(&line) else {
+            let Ok(mut command) = serde_json::from_slice::<Command>(&line) else {
                 break;
             };
             let id = command.id;
-            let reply = match control
-                .lock()
-                .map_err(storage)
-                .and_then(|mut r| r.command(command, network, &*reader_chain))
-            {
+            let result = if let Some(offer) = command.offer.take() {
+                if command.action != "broadcast" || !owner_id(&command.owner) || !command.scripts.is_empty() ||
+                    !command.descriptors.is_empty() || !command.outpoints.is_empty() || command.offset.is_some() ||
+                    command.query.is_some() || command.pending.is_some() { Err("Invalid wallet offer.") }
+                else if let Some(txid) = command.txid {
+                    offer::submit(&control, &reader_chain, &sender_peer, network, command.owner, txid, offer)
+                } else { Err("Missing wallet transaction id.") }
+            } else {
+                control.lock().map_err(storage).and_then(|mut r| r.command(command, network, &*reader_chain))
+            };
+            let reply = match result {
                 Ok(result) => json!({ "protocol":"chicory.watch/1", "id":id, "result":result }),
                 Err(error) => json!({ "protocol":"chicory.watch/1", "id":id, "error":error }),
             };

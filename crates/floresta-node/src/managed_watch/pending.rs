@@ -56,7 +56,7 @@ fn active(chain: &impl BlockchainInterface, tip: Cursor) -> bool {
         && chain.get_best_block().ok() == Some(tip)
 }
 
-fn mtp(chain: &impl BlockchainInterface, height: u32) -> Result<u32> {
+pub(super) fn mtp(chain: &impl BlockchainInterface, height: u32) -> Result<u32> {
     let mut hash = chain.get_block_hash(height).map_err(storage)?;
     let mut times = Vec::with_capacity(11);
     for _ in 0..height.saturating_add(1).min(11) {
@@ -86,7 +86,7 @@ fn check_proof(stump: &Stump, hashes: &[BitcoinNodeHash], proof: &Proof) -> Resu
     Ok(())
 }
 
-fn final_at(tx: &Transaction, coins: &[UtxoData], height: u32, time: u32) -> bool {
+pub(super) fn final_at(tx: &Transaction, coins: &[UtxoData], height: u32, time: u32) -> bool {
     let lock = tx.lock_time.to_consensus_u32();
     let reached = lock == 0 || lock < if lock < 500_000_000 { height } else { time };
     if !reached && tx.input.iter().any(|i| i.sequence.0 != u32::MAX) {
@@ -117,6 +117,10 @@ impl Pool {
         self.bytes = 0;
         self.anchor = anchor;
         self.revision += 1;
+    }
+
+    pub(super) fn spends_any(&self, tx: &Transaction) -> bool {
+        tx.input.iter().any(|input| self.spent.contains_key(&input.previous_output))
     }
 
     pub(super) fn reconcile(&mut self, chain: &impl BlockchainInterface) {

@@ -546,6 +546,7 @@ impl Florestad {
                 self.stop_signal.clone(),
             )?;
             electrum_server.restrict_to_chain_health();
+            let wallet_offers = chain_provider.get_handle().fixture_broadcast_available();
             let historical = historical.expect("managed status constructed with managed config");
             let endpoint = non_tls_listener.local_addr()?;
             let chain = blockchain_state.clone();
@@ -564,6 +565,7 @@ impl Florestad {
                     let status = serde_json::json!({
                         "protocol": "chicory.floresta/1", "watchProtocol": "chicory.watch/1",
                         "transactionProtocol": "chicory.tx/1", "confirmedReadsProtocol": "chicory.confirmed/1",
+                        "walletOfferProtocol": wallet_offers.then_some("chicory.offer/1"),
                         "pendingProtocol": "chicory.pending/1", "pendingTransactionProtocol": "chicory.pending-tx/1",
                         "network": network.to_string(),
                         "historical": historical.snapshot(height, validated, chain.is_in_ibd(), |at| chain.get_block_hash(at).ok()),

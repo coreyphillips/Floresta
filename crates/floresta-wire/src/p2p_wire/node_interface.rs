@@ -178,6 +178,13 @@ impl NodeInterface {
         }
     }
 
+    pub fn fixture_broadcast_available(&self) -> bool { self.managed_relay.is_some() }
+
+    pub fn offer_fixture_transaction(&self, tip: bitcoin::BlockHash, tx: Transaction,
+        allowed: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.managed_relay.as_ref()?.offer(tip, tx, allowed)
+    }
+
     /// Take bounded, untrusted wire candidates. The caller must verify the complete
     /// accumulator proof and script policy at its still-active validated tip.
     pub fn drain_proven_transactions(&self) -> Vec<crate::proven_tx::Candidate> {

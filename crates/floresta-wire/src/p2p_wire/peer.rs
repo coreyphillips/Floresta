@@ -318,6 +318,13 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 return Ok(());
             }
 
+            if self.state == State::Connected {
+                if let Some(id) = self.managed_relay.as_ref().and_then(|r| r.permitted())
+                    .and_then(|r| r.announcement(self.id)) {
+                    self.write(NetworkMessage::Inv(vec![Inventory::Transaction(id)])).await?;
+                }
+            }
+
             // utreexod serves MEMPOOL only to filter-capable clients. A peer snapshot is
             // bounded and has no completion marker. Refresh independent of wallet watches.
             if self.state == State::Connected
@@ -718,6 +725,14 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     }
 
     pub async fn handle_get_data(&mut self, inv: Inventory) -> Result<()> {
+        if let Inventory::Transaction(id) | Inventory::WitnessTransaction(id) = inv {
+            if let Some((tx, sent)) = self.managed_relay.as_ref().and_then(|r| r.permitted())
+                .and_then(|r| r.fulfill(self.id, id)) {
+                self.write(NetworkMessage::Tx(tx)).await?;
+                let _ = sent.try_send(());
+                return Ok(());
+            }
+        }
         match inv {
             Inventory::WitnessTransaction(txid) => {
                 let tx = self.mempool.lock().await.get_from_mempool(&txid).cloned();

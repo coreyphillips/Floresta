@@ -51,8 +51,19 @@ struct Request {
     since: Instant,
 }
 
+struct Offer {
+    tx: Transaction,
+    id: Txid,
+    owner_peer: Option<u32>,
+    deadline: Instant,
+    allowed: Arc<dyn Fn() -> bool + Send + Sync>,
+    sent: std::sync::mpsc::SyncSender<()>,
+}
+
 #[derive(Default)]
 struct State {
+    offered: bool,
+    outbound: Option<Offer>,
     tip: Option<Tip>,
     pending: HashMap<Txid, Request>,
     seen: HashMap<Txid, Instant>,
@@ -314,6 +325,38 @@ impl Relay {
         }
     }
 
+    // One authorized outgoing offer per distinct active tip. A lost reply or
+    // timeout never retries it. Its bytes never enter a shared peer mempool.
+    pub(crate) fn offer(&self, tip: BlockHash, tx: Transaction, allowed: Arc<dyn Fn() -> bool + Send + Sync>)
+        -> Option<std::sync::mpsc::Receiver<()>> {
+        let mut state = self.0.lock().ok()?;
+        if state.tip?.hash != tip || state.offered { return None; }
+        let (sent, receipt) = std::sync::mpsc::sync_channel(1);
+        state.offered = true;
+        state.outbound = Some(Offer { id: tx.compute_txid(), tx, allowed, sent, owner_peer: None,
+            deadline: Instant::now() + Duration::from_secs(7) });
+        Some(receipt)
+    }
+
+    pub(crate) fn announcement(&self, peer: u32) -> Option<Txid> {
+        let mut state = self.0.lock().ok()?;
+        let offer = state.outbound.as_mut()?;
+        if offer.owner_peer.is_some() || Instant::now() > offer.deadline { return None; }
+        offer.owner_peer = Some(peer);
+        let (id, allowed) = (offer.id, offer.allowed.clone());
+        drop(state);
+        allowed().then_some(id)
+    }
+
+    pub(crate) fn fulfill(&self, peer: u32, id: Txid) -> Option<(Transaction, std::sync::mpsc::SyncSender<()>)> {
+        let mut state = self.0.lock().ok()?;
+        let offer = state.outbound.as_ref()?;
+        if offer.owner_peer != Some(peer) || offer.id != id || Instant::now() > offer.deadline { return None; }
+        let offer = state.outbound.take()?;
+        drop(state);
+        (offer.allowed)().then_some((offer.tx, offer.sent))
+    }
+
     pub(crate) fn active_tip(&self) -> Option<BlockHash> {
         self.0.lock().unwrap().tip.map(|tip| tip.hash)
     }
@@ -463,6 +506,38 @@ impl Relay {
 mod tests {
     use super::*;
     use bitcoin::hex::FromHex;
+
+    #[test]
+    fn wallet_offers_are_one_use_and_private_to_the_exact_connected_fixture_peer_and_tip() {
+        let relay = test_relay();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let tip = genesis.block_hash();
+        let tx = genesis.txdata[0].clone();
+        let id = tx.compute_txid();
+        relay.tip(Some((101, tip, 101)));
+        assert!(relay.bind(bitcoin::Network::Regtest, Some("127.0.0.1:18445".parse().unwrap())).is_none());
+        assert!(relay.bind(bitcoin::Network::Bitcoin, Some("127.0.0.1:18444".parse().unwrap())).is_none());
+        let receipt = relay.offer(tip, tx.clone(), Arc::new(|| true)).unwrap();
+        assert!(relay.fulfill(1, id).is_none());
+        assert_eq!(relay.announcement(1), Some(id));
+        assert!(relay.announcement(2).is_none());
+        assert!(relay.fulfill(2, id).is_none());
+        let (delivered, ack) = relay.fulfill(1, id).unwrap();
+        assert_eq!(delivered, tx);
+        ack.try_send(()).unwrap();
+        assert!(receipt.try_recv().is_ok());
+        assert!(relay.offer(tip, tx.clone(), Arc::new(|| true)).is_none());
+        let other = BlockHash::all_zeros();
+        relay.tip(Some((102, other, 102)));
+        assert!(relay.offer(tip, tx.clone(), Arc::new(|| true)).is_none());
+        let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let live = permitted.clone();
+        let receipt = relay.offer(other, tx, Arc::new(move || live.load(std::sync::atomic::Ordering::Acquire))).unwrap();
+        assert_eq!(relay.announcement(1), Some(id));
+        permitted.store(false, std::sync::atomic::Ordering::Release);
+        assert!(relay.fulfill(1,id).is_none());
+        assert!(receipt.try_recv().is_err());
+    }
 
     fn test_relay() -> Relay {
         Relay::for_config(
