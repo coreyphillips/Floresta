@@ -307,7 +307,8 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     "max": 2016
                 })
             }
-            "blockchain.estimatefee" => json_rpc_res!(request, 0.0001),
+            // The pinned node has no fee estimator. Electrum uses -1 for unavailable.
+            "blockchain.estimatefee" => json_rpc_res!(request, -1),
             "blockchain.headers.subscribe" => {
                 let (height, hash) = self
                     .chain
@@ -359,13 +360,12 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 }
                 let mut final_utxos = Vec::new();
                 for (utxo, prevout) in utxos.unwrap().into_iter() {
-                    let height = self.address_cache.get_height(&prevout.txid).unwrap();
-
-                    let position = self.address_cache.get_position(&prevout.txid).unwrap();
+                    let height = self.address_cache.get_height(&prevout.txid)
+                        .ok_or(crate::error::Error::HistoryUnavailable)?;
 
                     final_utxos.push(json!({
                         "height": height,
-                        "tx_pos": position,
+                        "tx_pos": prevout.vout,
                         "tx_hash": prevout.txid,
                         "value": utxo.value
                     }));
@@ -497,27 +497,37 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }
             "blockchain.transaction.get" => {
                 let tx_id = get_arg!(request, Txid, 0);
-                let tx = self.address_cache.get_cached_transaction(&tx_id);
-                if let Some(tx) = tx {
-                    return json_rpc_res!(request, tx);
+                let verbose = match request.params.get(1) {
+                    Some(value) => value.as_bool().ok_or(crate::error::Error::InvalidParams)?,
+                    None => false,
+                };
+                let record = self.address_cache.get_transaction(&tx_id)
+                    .ok_or(crate::error::Error::HistoryUnavailable)?;
+                if record.tx.compute_txid() != tx_id {
+                    return Err(crate::error::Error::HistoryUnavailable);
                 }
-
-                Err(super::error::Error::InvalidParams)
+                let result = if verbose {
+                    crate::transaction::verbose(&record, self.chain.as_ref())?
+                } else {
+                    json!(serialize_hex(&record.tx))
+                };
+                json_rpc_res!(request, result)
             }
             "blockchain.transaction.get_merkle" => {
                 let tx_id = get_arg!(request, Txid, 0);
-                let proof = self.address_cache.get_merkle_proof(&tx_id);
-                let height = self.address_cache.get_height(&tx_id);
-                if let Some(proof) = proof {
-                    let result = json!({
-                        "merkle": proof.hashes,
-                        "block_height": height.unwrap_or(0),
-                        "pos": proof.pos
-                    });
-                    return json_rpc_res!(request, result);
+                let record = self.address_cache.get_transaction(&tx_id)
+                    .ok_or(crate::error::Error::HistoryUnavailable)?;
+                if record.tx.compute_txid() != tx_id
+                    || request.params.get(1).is_some_and(|h| h.as_u64() != Some(u64::from(record.height))) {
+                    return Err(crate::error::Error::HistoryUnavailable);
                 }
-
-                Err(super::error::Error::InvalidParams)
+                let (proof, _) = crate::transaction::active_proof(&record, self.chain.as_ref())?;
+                let result = json!({
+                    "merkle": proof.hashes,
+                    "block_height": record.height,
+                    "pos": proof.pos
+                });
+                json_rpc_res!(request, result)
             }
             //blockchain.transaction.id_from_pos
             // TODO: Create an actual histogram
@@ -758,20 +768,8 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     let id = req.id.to_owned();
                     let res = self.handle_client_request(client.clone(), req).await;
 
-                    if let Ok(res) = res {
-                        client.write(serde_json::to_string(&res).unwrap().as_bytes())?;
-                    } else {
-                        let res = json!({
-                            "jsonrpc": "2.0",
-                            "error": {
-                                "code": -32000,
-                                "message": "Internal JSON-RPC error.",
-                                "data": null
-                            },
-                            "id": id
-                        });
-                        client.write(serde_json::to_string(&res).unwrap().as_bytes())?;
-                    }
+                    let reply = res.unwrap_or_else(|error| error.rpc_reply(id));
+                    client.write(serde_json::to_string(&reply).unwrap().as_bytes())?;
                 } else if let Ok(requests) = serde_json::from_str::<Vec<Request>>(&msg) {
                     let mut results = Vec::new();
                     for req in requests {
@@ -784,20 +782,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                         let id = req.id.to_owned();
                         let res = self.handle_client_request(client.clone(), req).await;
 
-                        if let Ok(res) = res {
-                            results.push(res);
-                        } else {
-                            let res = json!({
-                                "jsonrpc": "2.0",
-                                "error": {
-                                    "code": -32000,
-                                    "message": "Internal JSON-RPC error.",
-                                    "data": null
-                                },
-                                "id": id
-                            });
-                            results.push(res);
-                        }
+                        results.push(res.unwrap_or_else(|error| error.rpc_reply(id)));
                     }
                     if let Some(client) = self.clients.get(&client) {
                         client.write(serde_json::to_string(&results).unwrap().as_bytes())?;
@@ -1318,7 +1303,7 @@ mod test {
 
         let batch_response = send_request(batch_req, port).await.unwrap();
 
-        assert_eq!(batch_response[0]["result"], 0.0001);
+        assert_eq!(batch_response[0]["result"], -1);
         assert_eq!(batch_response[1]["result"], 0.00001);
     }
 
@@ -1388,10 +1373,10 @@ mod test {
             "6bb0665122c7dcecc6e6c45b6384ee2bdce148aea097896e6f3e9e08070353ea".to_string()
         );
 
-        assert_eq!(
-            send_request(unspent_req, port).await.unwrap()["result"][0]["tx_hash"],
-            "6bb0665122c7dcecc6e6c45b6384ee2bdce148aea097896e6f3e9e08070353ea".to_string()
-        )
+        let reply = send_request(unspent_req, port).await.unwrap();
+        assert_eq!(reply["result"][0]["tx_hash"], "6bb0665122c7dcecc6e6c45b6384ee2bdce148aea097896e6f3e9e08070353ea");
+        // This transaction occupies position 1 in the block but has only output 0.
+        assert_eq!(reply["result"][0]["tx_pos"], 0);
     }
 
     #[tokio::test]
@@ -1438,10 +1423,9 @@ mod test {
             confirmed_tx
         );
 
-        assert_eq!(
-            send_request(get_merkle_req, port).await.unwrap()["result"]["merkle"][0],
-            "e7d6e69230db7dd074cc2610c32be013468f1c224172b347eccdef98f36e0834".to_string()
-        );
+        // The fixture contains the cached transaction at 118511 but only the
+        // first 2016 signet headers. Its cached proof cannot be authenticated.
+        assert!(send_request(get_merkle_req, port).await.unwrap()["error"].is_object());
     }
 
     #[tokio::test]
