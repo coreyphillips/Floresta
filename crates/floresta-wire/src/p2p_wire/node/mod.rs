@@ -188,7 +188,7 @@ pub struct LocalPeerView {
     pub(crate) state: PeerStatus,
 
     /// An id identifying this peer's address in our address manager
-    pub(crate) address_id: u32,
+    pub(crate) address_id: usize,
 
     /// A channel used to send requests to this peer
     pub(crate) channel: UnboundedSender<NodeRequest>,

@@ -71,7 +71,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-use crate::address_man::AddressState;
 use crate::block_proof::Bitmap;
 use crate::node::periodic_job;
 use crate::node::try_and_log;
@@ -183,12 +182,6 @@ where
                 error!("Error while downloading headers from peer={peer} err={e}");
 
                 self.disconnect_and_ban(peer)?;
-
-                let peer = self.peers.get(&peer).unwrap();
-                self.common.address_man.update_set_state(
-                    peer.address_id as usize,
-                    AddressState::Banned(ChainSelector::BAN_TIME),
-                );
             }
         }
 
@@ -704,10 +697,6 @@ where
     fn ban_peers_on_tip(&mut self, tip: BlockHash) -> Result<(), WireError> {
         for peer in self.common.peers.clone() {
             if self.context.tip_cache.get(&peer.0).copied().eq(&Some(tip)) {
-                self.address_man.update_set_state(
-                    peer.1.address_id as usize,
-                    AddressState::Banned(ChainSelector::BAN_TIME),
-                );
                 self.disconnect_and_ban(peer.0)?;
             }
         }
@@ -821,7 +810,7 @@ where
 
     /// Whether we have enough peers to start downloading headers
     fn can_start_headers_sync(&self) -> bool {
-        let connected_peers = self.connected_peers();
+        let connected_peers = self.connected_hosts();
         if self.network == Network::Regtest && connected_peers >= 1 {
             return true;
         }
@@ -915,6 +904,7 @@ where
         }
 
         let mut peer_accs = Vec::new();
+        let mut responding_hosts = HashSet::new();
         loop {
             // wait for all peers to respond or timeout after 1 minute
             if self.inflight.is_empty() {
@@ -929,7 +919,18 @@ where
 
                     NodeNotification::FromPeer(peer, message, _) => {
                         if let PeerMessages::UtreexoState(state) = message {
-                            self.inflight.remove(&InflightRequests::UtreexoState(peer));
+                            // Only one solicited accumulator response per peer and per host.
+                            if self
+                                .inflight
+                                .remove(&InflightRequests::UtreexoState(peer))
+                                .is_none()
+                                || !self
+                                    .peers
+                                    .get(&peer)
+                                    .is_some_and(|p| responding_hosts.insert(p.address))
+                            {
+                                continue;
+                            }
                             info!("got state {state:?}");
                             peer_accs.push((peer, state));
                         }

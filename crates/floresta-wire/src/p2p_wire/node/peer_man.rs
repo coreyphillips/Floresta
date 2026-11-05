@@ -2,6 +2,7 @@
 
 use core::net::IpAddr;
 use core::net::SocketAddr;
+use std::collections::HashSet;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -44,11 +45,8 @@ use crate::p2p_wire::peer::Version;
 #[derive(Debug, Clone)]
 /// A simple struct of added peers, used to track the ones we added manually by `addnode <ip:port> add` command.
 pub struct AddedPeerInfo {
-    /// The address of the peer
-    pub(crate) address: AddrV2,
-
-    /// The port of the peer
-    pub(crate) port: u16,
+    /// The exact endpoint and its address-manager identity, retained across reconnects.
+    pub(crate) endpoint: LocalAddress,
 
     /// Whether we should allow V1 fallback for this connection
     pub(crate) v1_fallback: bool,
@@ -113,6 +111,16 @@ where
             .values()
             .filter(|p| p.state == PeerStatus::Ready && p.is_long_lived())
             .count()
+    }
+
+    /// Count distinct hosts toward the header-sync peer threshold.
+    pub(crate) fn connected_hosts(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|p| p.state == PeerStatus::Ready && p.is_long_lived())
+            .map(|p| p.address)
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     /// Sends a request to an initialized peer that supports `required_service`, chosen via a
@@ -264,6 +272,13 @@ where
         peer: u32,
         mut version: Version,
     ) -> Result<(), WireError> {
+        if self
+            .peers
+            .get(&peer)
+            .is_some_and(|p| p.state == PeerStatus::Banned)
+        {
+            return Err(WireError::PeerMisbehaving);
+        }
         self.inflight.remove(&InflightRequests::Connect(peer));
 
         // Mark this peer as ready to communicate with
@@ -512,8 +527,7 @@ where
                         .update_set_state(idx, AddressState::Failed(now));
                 }
                 PeerStatus::Banned => {
-                    self.address_man
-                        .update_set_state(idx, AddressState::Banned(RunningNode::BAN_TIME));
+                    self.address_man.ban_host(idx, RunningNode::BAN_TIME);
                 }
             }
         }
@@ -582,17 +596,21 @@ where
 
     /// Disconnects a peer and bans it for `T::BAN_TIME`.
     pub(crate) fn disconnect_and_ban(&mut self, peer: PeerId) -> Result<(), WireError> {
-        if let Some(peer) = self.peers.get_mut(&peer) {
-            // Manual connections are exempt from being punished
-            if peer.is_manual_peer() {
-                return Ok(());
-            }
-
-            // `handle_disconnection` will mark the address as banned when `Peer` object return
-            peer.state = PeerStatus::Banned;
+        let source = self.peers.get(&peer).ok_or(WireError::PeerNotFound)?;
+        if source.is_manual_peer() {
+            return Ok(());
         }
-
-        self.send_to_peer(peer, NodeRequest::Shutdown)?;
+        let host = source.address;
+        let id = source.address_id;
+        self.address_man.ban_host(id, T::BAN_TIME);
+        for sibling in self
+            .peers
+            .values_mut()
+            .filter(|p| p.address == host && !p.is_manual_peer())
+        {
+            sibling.state = PeerStatus::Banned;
+            let _ = sibling.channel.send(NodeRequest::Shutdown);
+        }
         Ok(())
     }
 
@@ -769,7 +787,7 @@ where
             .peers
             .values()
             .filter(|peer| peer.state == PeerStatus::Ready && peer.serves_block_proofs())
-            .map(|peer| peer.address_id as usize)
+            .map(|peer| peer.address_id)
             .collect();
         if peers_usize.is_empty() {
             warn!("No connected Utreexo peers to save to disk");
@@ -922,22 +940,14 @@ where
         if self
             .added_peers
             .iter()
-            .any(|info| address == info.address && port == info.port)
+            .any(|info| address == info.endpoint.get_addrv2() && port == info.endpoint.get_port())
         {
             return Err(WireError::PeerAlreadyExists(addr, port));
         }
 
-        // Add this address to our address manager for later
-        // assume it has the bare-minimum services, otherwise `push_addresses` will ignore it
-        let mut local_address = LocalAddress::from(address.clone());
-        local_address.set_services(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS);
-
-        self.address_man.push_addresses(&[local_address]);
-
-        // Add a simple reference to the peer
+        let endpoint = self.address_man.manual_endpoint(address, port);
         self.added_peers.push(AddedPeerInfo {
-            address,
-            port,
+            endpoint,
             v1_fallback: !v2_transport,
         });
 
@@ -960,10 +970,9 @@ where
         debug!("Trying to remove peer {addr}:{port}");
 
         let address = self.to_addr_v2(addr);
-        let index = self
-            .added_peers
-            .iter()
-            .position(|info| address == info.address && port == info.port);
+        let index = self.added_peers.iter().position(|info| {
+            address == info.endpoint.get_addrv2() && port == info.endpoint.get_port()
+        });
 
         match index {
             Some(peer_id) => self.added_peers.remove(peer_id),
@@ -1010,19 +1019,8 @@ where
             return Err(WireError::PeerAlreadyExists(addr, port));
         }
 
-        let kind = ConnectionKind::Manual;
-
-        // Add this address to our address manager for later
-        // assume it has the bare-minimum services, otherwise `push_addresses` will ignore it
-        let address_v2 = self.to_addr_v2(addr);
-        let mut local_address = LocalAddress::from(address_v2.clone());
-
-        local_address.set_port(port);
-        local_address.set_services(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS);
-
-        self.address_man.push_addresses(&[local_address.clone()]);
-        // Return true if exists or false if anything fails during connection
-        // We allow V1 fallback iff the `v2` flag is not set
-        self.open_connection(kind, local_address.id, local_address, !v2_transport)
+        let address = self.to_addr_v2(addr);
+        let endpoint = self.address_man.manual_endpoint(address, port);
+        self.open_connection(ConnectionKind::Manual, endpoint, !v2_transport)
     }
 }

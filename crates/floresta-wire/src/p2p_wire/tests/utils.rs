@@ -175,7 +175,7 @@ pub fn create_peer(
 
     LocalPeerView {
         message_times: Ema::with_half_life_50(),
-        address: "127.0.0.1".parse().unwrap(),
+        address: IpAddr::V4((0x7f00_0001 + peer_id).into()),
         services: service_flags::UTREEXO.into(),
         user_agent: "/utreexo:0.1.0/".to_string(),
         height: 0,
@@ -490,13 +490,102 @@ fn routing_peer(
             state: PeerStatus::Ready,
             kind: ConnectionKind::Regular(services),
             banscore: 0,
-            address_id: id,
+            address_id: id as usize,
             _last_message: Instant::now(),
             transport_protocol: TransportProtocol::V2,
             message_times: latency,
         },
     );
     receiver
+}
+
+#[tokio::test]
+async fn a_pinned_second_port_fills_a_missing_proof_service_only() {
+    use crate::address_man::LocalAddress;
+
+    let (dir, mut node) = routing_node();
+    // Keep both disposable TCP ports claimed by this test throughout. No handshake leaves loopback.
+    let core = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let core_addr = core.local_addr().unwrap();
+    let mut raw = LocalAddress::try_from(core_addr.to_string().as_str()).unwrap();
+    let mut proof =
+        LocalAddress::try_from(bridge.local_addr().unwrap().to_string().as_str()).unwrap();
+    let proof_service: ServiceFlags = service_flags::UTREEXO.into();
+    raw.set_services(ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    proof.set_services(proof_service | ServiceFlags::WITNESS);
+    node.open_connection(
+        ConnectionKind::Regular(ServiceFlags::NETWORK),
+        raw.clone(),
+        false,
+    )
+    .unwrap();
+    let requested = ConnectionKind::Regular(proof_service);
+    assert!(node
+        .open_connection(requested, proof.clone(), false)
+        .is_err());
+    let first_id = node.peers.keys().copied().next().unwrap();
+    let first = node.peers.get_mut(&first_id).unwrap();
+    first.services = raw.get_services();
+    first.state = PeerStatus::Ready;
+    assert!(node
+        .open_connection(
+            ConnectionKind::Regular(ServiceFlags::NONE),
+            proof.clone(),
+            false
+        )
+        .is_err());
+    assert!(node.open_connection(requested, raw.clone(), false).is_err());
+    node.open_connection(requested, proof.clone(), false)
+        .unwrap();
+    let second = node
+        .peers
+        .values_mut()
+        .find(|p| p.port == proof.get_port())
+        .unwrap();
+    second.state = PeerStatus::Ready;
+    second.services = proof.get_services();
+    assert_eq!(node.connected_peers(), 2);
+    assert_eq!(node.connected_hosts(), 1);
+    assert_eq!(node.peers[&first_id].address_id, raw.id);
+    assert!(node
+        .open_connection(requested, proof.clone(), false)
+        .is_err());
+
+    node.peers.remove(&first_id);
+    // Reverse arrival order: a verified proof-only peer keeps its connection while raw
+    // blocks come from the other pinned port. Generic and duplicate attempts are refused.
+    assert!(node
+        .open_connection(
+            ConnectionKind::Regular(ServiceFlags::NONE),
+            raw.clone(),
+            false
+        )
+        .is_err());
+    node.open_connection(
+        ConnectionKind::Regular(ServiceFlags::NETWORK),
+        raw.clone(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(node.peers.len(), 2);
+
+    // Exact operator-supplied port and address ID survive reconnect without relying on live IDs.
+    node.peers.clear();
+    node.handle_addnode_add_peer(core_addr.ip(), core_addr.port(), true)
+        .unwrap();
+    let explicit = node.added_peers[0].endpoint.clone();
+    assert_eq!(explicit.get_socket_address(), core_addr);
+    assert_eq!(node.peers.values().next().unwrap().address_id, explicit.id);
+    node.peers.clear();
+    node.maybe_open_connection_with_added_peers().unwrap();
+    assert_eq!(node.peers.values().next().unwrap().address_id, explicit.id);
+    assert_eq!(node.peers.values().next().unwrap().port, core_addr.port());
+    node.handle_addnode_onetry_peer(core_addr.ip(), proof.get_port(), true)
+        .unwrap();
+    assert_eq!(node.peers.len(), 2);
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

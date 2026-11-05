@@ -398,6 +398,12 @@ impl AddressMan {
 
     /// Add a new address to our list of known address
     pub fn push_addresses(&mut self, addresses: &[LocalAddress]) {
+        self.insert_addresses(addresses, false);
+    }
+
+    // Gossip cannot create additional identities by cycling through ports. Only fixed seeds,
+    // explicit user endpoints, and entries restored from our own store may share a host.
+    fn insert_addresses(&mut self, addresses: &[LocalAddress], local: bool) {
         for address in addresses {
             let id = address.id;
             // don't add addresses that don't have the minimum required services
@@ -418,11 +424,16 @@ impl AddressMan {
             if self
                 .addresses
                 .values()
-                .any(|x| x.address == address.address)
+                .any(|x| x.address == address.address && (!local || x.port == address.port))
             {
                 continue;
             }
 
+            let mut address = address.clone();
+            if let Some(until) = self.banned_until(&address.address) {
+                address.state = AddressState::Banned(until);
+            }
+            let address = &address;
             if let std::collections::hash_map::Entry::Vacant(e) = self.addresses.entry(id) {
                 e.insert(address.clone());
                 if address.is_good_address() {
@@ -439,6 +450,44 @@ impl AddressMan {
 
         // Open up space by pruning old addresses
         self.prune_addresses();
+    }
+
+    // Explicit loopback/private peers remain usable without advertising them to the network.
+    pub(crate) fn manual_endpoint(&mut self, host: AddrV2, port: u16) -> LocalAddress {
+        let mut endpoint = LocalAddress::from(host);
+        endpoint.set_port(port);
+        endpoint.set_services(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS);
+        self.remember_local_endpoint(endpoint)
+    }
+
+    pub(crate) fn remember_local_endpoint(&mut self, mut endpoint: LocalAddress) -> LocalAddress {
+        if let Some(known) = self
+            .addresses
+            .values()
+            .find(|a| a.address == endpoint.address && a.port == endpoint.port)
+        {
+            return known.clone();
+        }
+        while self.addresses.contains_key(&endpoint.id) {
+            endpoint.id = rand::random();
+        }
+        self.insert_addresses(std::slice::from_ref(&endpoint), true);
+        self.addresses
+            .get(&endpoint.id)
+            .cloned()
+            .unwrap_or(endpoint)
+    }
+
+    pub(crate) fn banned_until(&self, host: &AddrV2) -> Option<u64> {
+        let now = Self::time_since_unix();
+        self.addresses
+            .values()
+            .filter(|addr| &addr.address == host)
+            .filter_map(|addr| match addr.state {
+                AddressState::Banned(until) if until > now => Some(until),
+                _ => None,
+            })
+            .max()
     }
 
     /// Check if we can reach this address based on our reachable networks
@@ -772,7 +821,7 @@ impl AddressMan {
                 .map(Into::<LocalAddress>::into)
                 .collect::<Vec<_>>();
 
-            self.push_addresses(&peers);
+            self.insert_addresses(&peers, true);
         }
 
         let anchors = read_to_string(format!("{datadir}/anchors.json")).and_then(|anchors| {
@@ -880,9 +929,31 @@ impl AddressMan {
         Some((*peer, self.addresses.get(peer)?.to_owned()))
     }
 
+    // A host ban applies across every known port, including a newly restored seed.
+    pub(crate) fn ban_host(&mut self, id: usize, duration: u64) {
+        let Some(host) = self.addresses.get(&id).map(|a| a.address.clone()) else {
+            return;
+        };
+        let until = Self::time_since_unix().saturating_add(duration);
+        let mut banned = HashSet::new();
+        for address in self.addresses.values_mut().filter(|a| a.address == host) {
+            address.state = AddressState::Banned(until);
+            banned.insert(address.id);
+        }
+        self.good_addresses.retain(|id| !banned.contains(id));
+        for peers in self.good_peers_by_service.values_mut() {
+            peers.retain(|id| !banned.contains(id));
+        }
+    }
+
     /// Updates the state of an address
     pub fn update_set_state(&mut self, idx: usize, state: AddressState) -> &mut Self {
         if let Some(address) = self.addresses.get_mut(&idx) {
+            if matches!(address.state, AddressState::Banned(until) if until > Self::time_since_unix())
+            {
+                // A late disconnect or handshake cannot cancel a host ban.
+                return self;
+            }
             address.state = state;
         }
 
@@ -1012,7 +1083,7 @@ impl AddressMan {
             .map(Into::<LocalAddress>::into)
             .collect::<Vec<_>>();
 
-        self.push_addresses(&peers);
+        self.insert_addresses(&peers, true);
     }
 }
 
@@ -1239,6 +1310,80 @@ mod test {
                 peer.get_addrv2() == other.get_addrv2() && peer.get_port() == other.get_port()
             }));
         }
+    }
+
+    #[test]
+    fn fixed_endpoints_survive_gossip_and_restart_without_extra_host_identities() {
+        let mut peers = AddressMan::new(None, SUPPORTED_NETWORKS);
+        let host = AddrV2::Ipv4("195.26.240.213".parse().unwrap());
+        peers.add_fixed_addresses(Network::Bitcoin);
+        let ports = |manager: &AddressMan| {
+            let mut ports: Vec<_> = manager
+                .addresses
+                .values()
+                .filter(|a| a.address == host)
+                .map(|a| a.port)
+                .collect();
+            ports.sort();
+            ports
+        };
+        assert_eq!(ports(&peers), [8333, 8433]);
+
+        let core = peers.manual_endpoint(host.clone(), 8333);
+        let bridge = peers.manual_endpoint(host.clone(), 8433);
+        assert_ne!(core.id, bridge.id);
+        peers.update_set_service_flag(
+            core.id,
+            ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+        );
+        peers.update_set_service_flag(
+            bridge.id,
+            ServiceFlags::WITNESS | service_flags::UTREEXO.into(),
+        );
+        let candidates = &peers.peers_by_service[&service_flags::UTREEXO.into()];
+        assert!(candidates.contains(&bridge.id));
+        assert!(!candidates.contains(&core.id));
+
+        let adverts: Vec<_> = (8400..8500)
+            .map(|port| {
+                let mut a = bridge.clone();
+                a.id = rand::random();
+                a.set_port(port);
+                a
+            })
+            .collect();
+        peers.push_addresses(&adverts);
+        peers.add_fixed_addresses(Network::Bitcoin);
+        assert_eq!(ports(&peers), [8333, 8433]);
+        assert_eq!(peers.manual_endpoint(host.clone(), 8433).id, bridge.id);
+
+        let dir =
+            std::env::temp_dir().join(format!("floresta-endpoints-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        peers.dump_peers(path).unwrap();
+        let mut restored = AddressMan::new(None, SUPPORTED_NETWORKS);
+        restored.start_addr_man(path.to_string());
+        assert_eq!(ports(&restored), [8333, 8433]);
+        assert_eq!(restored.manual_endpoint(host.clone(), 8433).id, bridge.id);
+        restored.ban_host(bridge.id, 86400);
+        let until = restored.banned_until(&host).unwrap();
+        assert!(until >= AddressMan::time_since_unix() + 86399);
+        restored.update_set_state(core.id, AddressState::Tried(0));
+        restored.add_fixed_addresses(Network::Bitcoin);
+        assert!(matches!(
+            restored.manual_endpoint(host.clone(), 8333).state,
+            AddressState::Banned(_)
+        ));
+        assert!(matches!(
+            restored.manual_endpoint(host.clone(), 8434).state,
+            AddressState::Banned(_)
+        ));
+        restored.dump_peers(path).unwrap();
+        peers = AddressMan::new(None, SUPPORTED_NETWORKS);
+        peers.start_addr_man(path.to_string());
+        assert_eq!(peers.banned_until(&host), Some(until));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn load_addresses_from_json(file_path: &str) -> io::Result<Vec<LocalAddress>> {
