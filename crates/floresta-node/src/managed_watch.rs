@@ -3,6 +3,8 @@
 //! The cursor and its block's matches are committed in the same database batch.
 //! No Electrum client can register a watch or read this index.
 
+mod confirmed;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
@@ -49,6 +51,8 @@ struct Command {
     txid: Option<Txid>,
     #[serde(default)]
     offset: Option<u32>,
+    #[serde(default)]
+    query: Option<confirmed::Query>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -169,8 +173,8 @@ impl Registry {
                 unavailable: false,
             };
             match version.as_deref() {
-                Some(b"1") => (),
-                None => owner.reset_to(owner.watches.clone())?,
+                Some(b"2") => (),
+                Some(b"1") | None => owner.reset_to(owner.watches.clone())?,
                 _ => return Err("Unsupported managed proof index format."),
             }
             owners.insert(id.to_string(), owner);
@@ -186,6 +190,22 @@ impl Registry {
     ) -> Result<Value> {
         if !owner_id(&request.owner) {
             return Err("Invalid watch owner.");
+        }
+        if let Some(query) = request.query {
+            if request.action != "confirmed"
+                || request.txid.is_some()
+                || request.offset.is_some()
+                || !request.scripts.is_empty()
+                || !request.descriptors.is_empty()
+                || !request.outpoints.is_empty()
+            {
+                return Err("Invalid confirmed script request.");
+            }
+            let Some(owner) = self.owners.get_mut(&request.owner) else {
+                return Ok(json!({"phase":"unavailable"}));
+            };
+            owner.reconcile(chain)?;
+            return confirmed::page(owner, chain, query);
         }
         if request.action == "transaction" {
             if !request.scripts.is_empty()
@@ -296,7 +316,13 @@ impl Owner {
         for key in self.tree.iter().keys() {
             batch.remove(key.map_err(storage)?);
         }
-        batch.insert(b"proof-format", &b"1"[..]);
+        batch.insert(b"proof-format", &b"2"[..]);
+        for script in &watches.scripts {
+            batch.insert(
+                format!("script/{}", floresta_common::get_spk_hash(script)).as_bytes(),
+                &[],
+            );
+        }
         batch.insert(b"watches", serde_json::to_vec(&watches).map_err(storage)?);
         self.tree.apply_batch(batch).map_err(storage)?;
         self.tree.flush().map_err(storage)?;
@@ -325,6 +351,7 @@ impl Owner {
 
     fn apply(&mut self, height: u32, block: &Block) -> Result<()> {
         let mut batch = sled::Batch::default();
+        confirmed::apply(self, &mut batch, height, block)?;
         let mut found = HashSet::new();
         let mut matched = self.matched;
         let mut parents = HashSet::new();

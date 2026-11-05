@@ -561,7 +561,7 @@ impl Florestad {
                     };
                     let status = serde_json::json!({
                         "protocol": "chicory.floresta/1", "watchProtocol": "chicory.watch/1",
-                        "transactionProtocol": "chicory.tx/1",
+                        "transactionProtocol": "chicory.tx/1", "confirmedReadsProtocol": "chicory.confirmed/1",
                         "network": network.to_string(),
                         "historical": historical.snapshot(height, validated, chain.is_in_ibd(), |at| chain.get_block_hash(at).ok()),
                         "endpoint": endpoint.to_string(), "genesis": genesis.to_string(),
