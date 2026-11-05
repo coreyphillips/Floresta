@@ -392,14 +392,14 @@ where
         })
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) -> Result<(), floresta_chain::BlockchainError> {
         info!("Shutting down node...");
         try_and_warn!(self.save_utreexo_peers());
         for peer in self.peer_ids.iter() {
             try_and_log!(self.send_to_peer(*peer, NodeRequest::Shutdown));
         }
         try_and_log!(self.save_peers());
-        try_and_log!(self.chain.flush());
+        self.chain.flush()
     }
 }
 

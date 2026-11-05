@@ -167,6 +167,9 @@ pub enum AssumeValidArg {
     UserInput(BlockHash),
 }
 
+/// Whether this build executes scripts using the consensus kernel.
+pub const SCRIPT_KERNEL_ENABLED: bool = cfg!(feature = "bitcoinkernel");
+
 /// A header tip and its active validated height, read under one chainstate lock.
 pub struct ActiveChainStatus {
     pub height: u32,
@@ -1331,6 +1334,32 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         Ok(())
     }
 
+    fn verified_descendant(
+        &self,
+        ancestor: (u32, BlockHash),
+    ) -> Result<Option<(u32, BlockHash, Stump)>, BlockchainError> {
+        let inner = self.inner.read();
+        let best = &inner.best_block;
+        if !SCRIPT_KERNEL_ENABLED
+            || inner.assume_valid.is_some()
+            || inner.ibd
+            || best.validation_index != best.best_block
+            || ancestor.0 > best.depth
+            || inner.chainstore.get_block_hash(ancestor.0)? != Some(ancestor.1)
+            || inner.chainstore.get_block_hash(best.depth)? != Some(best.best_block)
+        {
+            return Ok(None);
+        }
+        match inner.chainstore.get_header(&best.best_block)? {
+            Some(DiskBlockHeader::FullyValid(header, height))
+                if height == best.depth && header.block_hash() == best.best_block =>
+            {
+                Ok(Some((height, best.best_block, inner.acc.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn toggle_ibd(&self, is_ibd: bool) {
         let mut inner = write_lock!(self);
         inner.ibd = is_ibd;
@@ -1745,6 +1774,40 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "bitcoinkernel")]
+    fn verified_descendant_requires_active_ancestor_current_tip_and_full_script_policy() {
+        let mut blocks = include_str!("../../testdata/blocks.txt")
+            .lines()
+            .map(|s| deserialize_hex::<Block>(s).unwrap());
+        let genesis = blocks.next().unwrap().block_hash();
+        let block = blocks.next().unwrap();
+        let next = blocks.next().unwrap();
+        for policy in [
+            AssumeValidArg::Disabled,
+            AssumeValidArg::UserInput(block.block_hash()),
+        ] {
+            let chain = setup_test_chain(Network::Regtest, policy);
+            chain.accept_header(block.header).unwrap();
+            chain
+                .connect_block(&block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+            chain.toggle_ibd(false);
+            let sealed = chain.verified_descendant((0, genesis)).unwrap();
+            if matches!(policy, AssumeValidArg::UserInput(_)) {
+                assert!(sealed.is_none());
+                continue;
+            }
+            assert_eq!(sealed, Some((1, block.block_hash(), chain.acc())));
+            assert!(chain.verified_descendant((1, genesis)).unwrap().is_none());
+            chain.toggle_ibd(true);
+            assert!(chain.verified_descendant((0, genesis)).unwrap().is_none());
+            chain.toggle_ibd(false);
+            chain.accept_header(next.header).unwrap();
+            assert!(chain.verified_descendant((0, genesis)).unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn replay_preserves_persisted_stump_at_the_selected_block() {
         let mut parsed = include_str!("../../testdata/blocks.txt")
             .lines()
@@ -1835,6 +1898,23 @@ mod test {
             (status.height, status.validated, status.tip),
             (10, 5, fork[4].block_hash())
         );
+
+        #[cfg(feature = "bitcoinkernel")]
+        {
+            chain.toggle_ibd(false);
+            for block in &fork[..5] {
+                chain
+                    .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                    .unwrap();
+            }
+            let detached = (10, original[9].block_hash());
+            let common = (5, original[4].block_hash());
+            assert!(chain.verified_descendant(detached).unwrap().is_none());
+            assert_eq!(
+                chain.verified_descendant(common).unwrap(),
+                Some((10, fork[4].block_hash(), chain.acc()))
+            );
+        }
     }
 
     #[test]

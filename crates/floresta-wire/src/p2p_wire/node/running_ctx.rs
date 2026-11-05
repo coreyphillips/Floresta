@@ -211,7 +211,11 @@ where
             .into());
         }
 
-        let checkpoint = Checkpoint::open(Path::new(&self.config.datadir), anchor.clone())?;
+        let checkpoint = Checkpoint::open(
+            Path::new(&self.config.datadir),
+            self.config.network,
+            anchor.clone(),
+        )?;
         let (height, stump, complete) = checkpoint
             .recover(|at| self.chain.get_block_hash(at).ok())
             .unwrap_or_else(|error| {
@@ -415,7 +419,7 @@ where
         };
 
         if *self.kill_signal.read().await {
-            self.shutdown();
+            try_and_log!(self.shutdown());
             try_and_log!(stop_signal.send(()));
             return;
         }
@@ -455,7 +459,7 @@ where
             if is_backfilling {
                 let _ = tokio::task::spawn_blocking(move || recv.recv()).await;
             }
-            self.shutdown();
+            try_and_log!(self.shutdown());
             stop_signal.send(()).unwrap();
             return;
         }
@@ -512,8 +516,55 @@ where
             let _ = tokio::task::spawn_blocking(move || recv.recv()).await;
         }
 
-        self.shutdown();
+        match self.shutdown() {
+            Ok(()) => try_and_warn!(self.seal_managed_prefix()),
+            Err(error) => warn!("Could not flush the chain store: {error}"),
+        }
         let _ = stop_signal.send(());
+    }
+
+    /// Called after the main writer has stopped, replay has joined and the chain store
+    /// has flushed. A crash before this point leaves the previous valid checkpoint.
+    fn seal_managed_prefix(&self) -> Result<(), WireError> {
+        use crate::p2p_wire::historical::Checkpoint;
+        use floresta_chain::{AssumeUtreexoValue, ChainParams};
+        use std::path::Path;
+
+        let Some(ancestor) = self
+            .config
+            .historical
+            .as_ref()
+            .and_then(|h| h.completed_anchor())
+        else {
+            return Ok(());
+        };
+        let network = self.config.network;
+        let pin = ChainParams::get_assume_utreexo(network);
+        if pin.height != 0
+            || !self.config.backfill
+            || self.config.pow_fraud_proofs
+            || !self.config.assume_utreexo.as_ref().is_some_and(|a| {
+                a.height == 0
+                    && a.leaves == 0
+                    && a.roots.is_empty()
+                    && a.block_hash == pin.block_hash
+            })
+            || self.chain.get_block_hash(0)? != pin.block_hash
+        {
+            return Ok(());
+        }
+        let Some((height, block_hash, stump)) = self.chain.verified_descendant(ancestor)? else {
+            return Ok(());
+        };
+        let target = AssumeUtreexoValue {
+            height,
+            block_hash,
+            leaves: stump.leaves,
+            roots: stump.roots.clone(),
+        };
+        Checkpoint::open(Path::new(&self.config.datadir), network, target)?
+            .store(height, block_hash, &stump, true)?;
+        Ok(())
     }
 
     /// Performs the periodic maintenance tasks, including checking for the cancel signal, peer

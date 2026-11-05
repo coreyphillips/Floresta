@@ -158,6 +158,15 @@ pub trait UpdatableChainstate {
     fn handle_transaction(&self) -> Result<(), BlockchainError>;
     /// Persists our data. Should be invoked periodically.
     fn flush(&self) -> Result<(), BlockchainError>;
+    /// Confirm the active tip and stump under one lock, above an independently verified ancestor.
+    /// Backends without a fully script-validating foreground cannot seal a managed prefix.
+    fn verified_descendant(
+        &self,
+        _ancestor: (u32, BlockHash),
+    ) -> Result<Option<(u32, BlockHash, Stump)>, BlockchainError> {
+        Ok(None)
+    }
+
     /// First historical validation failure, if this backend is replaying a partial chain.
     fn replay_failure(&self) -> Option<String> {
         None
@@ -208,6 +217,13 @@ pub enum Notification {
 impl<T: UpdatableChainstate> UpdatableChainstate for Arc<T> {
     fn flush(&self) -> Result<(), BlockchainError> {
         T::flush(self)
+    }
+
+    fn verified_descendant(
+        &self,
+        ancestor: (u32, BlockHash),
+    ) -> Result<Option<(u32, BlockHash, Stump)>, BlockchainError> {
+        T::verified_descendant(self, ancestor)
     }
 
     fn get_acc(&self) -> Stump {

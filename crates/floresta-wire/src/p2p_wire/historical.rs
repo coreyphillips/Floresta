@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
-use bitcoin::BlockHash;
-use floresta_chain::AssumeUtreexoValue;
+use bitcoin::{BlockHash, Network};
+use floresta_chain::{AssumeUtreexoValue, ChainParams};
 use rand::{rngs::OsRng, RngCore};
 use rustreexo::stump::Stump;
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,14 @@ impl Historical {
             error: None,
             anchor: Some(anchor.block_hash),
         };
+    }
+
+    pub(crate) fn completed_anchor(&self) -> Option<(u32, BlockHash)> {
+        let progress = self.0.lock().unwrap();
+        if progress.state == "verified" && progress.height == progress.target {
+            return Some((progress.target, progress.anchor?));
+        }
+        None
     }
 
     pub(crate) fn failed(&self) -> bool {
@@ -166,6 +174,7 @@ pub(crate) struct Checkpoint {
     path: PathBuf,
     key: [u8; MAC_SIZE],
     pub anchor: AssumeUtreexoValue,
+    moving_target: bool,
 }
 
 // NodeContext requires Debug. Keep the integrity key out of logs.
@@ -178,7 +187,11 @@ impl std::fmt::Debug for Checkpoint {
 }
 
 impl Checkpoint {
-    pub(crate) fn open(dir: &Path, anchor: AssumeUtreexoValue) -> io::Result<Self> {
+    pub(crate) fn open(
+        dir: &Path,
+        network: Network,
+        anchor: AssumeUtreexoValue,
+    ) -> io::Result<Self> {
         let key_path = dir.join(KEY_FILE);
         let key = match read_bounded(&key_path, MAC_SIZE) {
             Ok(bytes) => bytes
@@ -192,10 +205,24 @@ impl Checkpoint {
             }
             Err(error) => return Err(error),
         };
+        // Bind the unchanged record layout to the network, consensus policy and
+        // released assumption. Old unbound records trigger a full replay.
+        let pin = ChainParams::get_assume_utreexo(network);
+        let mut domain = HmacEngine::<sha256::Hash>::new(&key);
+        domain.input(b"chicory.full-script-replay/2");
+        domain.input(&network.magic().to_bytes());
+        domain.input(&[u8::from(floresta_chain::SCRIPT_KERNEL_ENABLED)]);
+        domain.input(&pin.height.to_le_bytes());
+        domain.input(pin.block_hash.as_byte_array());
+        domain.input(&encode_stump(&Stump {
+            roots: pin.roots,
+            leaves: pin.leaves,
+        })?);
         Ok(Self {
             path: dir.join(STATE_FILE),
-            key,
+            key: Hmac::from_engine(domain).to_byte_array(),
             anchor,
+            moving_target: pin.height == 0,
         })
     }
 
@@ -255,12 +282,17 @@ impl Checkpoint {
             return Err(invalid("Invalid historical checkpoint integrity tag"));
         }
         let record: Record = serde_json::from_slice(&bytes[MAC_SIZE..])?;
+        let same_target = record.target == self.anchor.height
+            && record.anchor == self.anchor.block_hash.to_byte_array();
+        // A completed older target authenticates only its own prefix. Incomplete
+        // or detached targets cannot be moved, and a released pin is immutable.
+        let prefix = self.moving_target && record.complete && record.target < self.anchor.height;
         if record.version != 1
-            || record.target != self.anchor.height
-            || record.anchor != self.anchor.block_hash.to_byte_array()
+            || !(same_target || prefix)
             || record.height > record.target
             || hash_at(record.height) != Some(BlockHash::from_byte_array(record.hash))
             || (record.complete && record.height != record.target)
+            || (record.height == record.target && record.hash != record.anchor)
         {
             return Err(invalid(
                 "Historical checkpoint does not match the selected chain",
@@ -279,19 +311,17 @@ impl Checkpoint {
         let stump = Stump::deserialize(record.stump.as_slice())
             .map_err(|_| invalid("Invalid accumulator"))?;
         if encode_stump(&stump)? != record.stump
-            || (record.height == record.target && !self.matches(&stump))
+            || (same_target && record.height == record.target && !self.matches(&stump))
         {
             return Err(invalid("Historical accumulator mismatch"));
         }
-        Ok((record.height, stump, record.complete))
+        Ok((record.height, stump, same_target && record.complete))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::Network;
-    use floresta_chain::ChainParams;
     use rustreexo::node_hash::BitcoinNodeHash;
 
     fn anchor() -> AssumeUtreexoValue {
@@ -307,14 +337,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".sync_node_state"), []).unwrap();
         let anchor = anchor();
-        let checkpoint = Checkpoint::open(dir.path(), anchor.clone()).unwrap();
+        let checkpoint = Checkpoint::open(dir.path(), Network::Regtest, anchor.clone()).unwrap();
         assert_eq!(
             checkpoint.recover(|_| None).unwrap(),
             (0, Stump::default(), false)
         );
         let hash = BlockHash::all_zeros();
         checkpoint.store(1, hash, &Stump::default(), false).unwrap();
-        let reopened = Checkpoint::open(dir.path(), anchor.clone()).unwrap();
+        let reopened = Checkpoint::open(dir.path(), Network::Regtest, anchor.clone()).unwrap();
         assert_eq!(
             reopened.recover(|_| Some(hash)).unwrap(),
             (1, Stump::default(), false)
@@ -347,6 +377,85 @@ mod tests {
             std::fs::write(&reopened.path, torn).unwrap();
             assert!(reopened.recover(|_| Some(anchor.block_hash)).is_err());
         }
+    }
+
+    #[test]
+    fn checkpoint_prefix_replays_only_the_suffix_and_preserves_pinned_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = anchor();
+        let old_stump = Stump {
+            leaves: old.leaves,
+            roots: old.roots.clone(),
+        };
+        let mut later = old.clone();
+        later.height += 2;
+        later.block_hash = BlockHash::from_byte_array([7; 32]);
+        later.roots = vec![BitcoinNodeHash::new([3; 32])];
+
+        for network in [Network::Regtest, Network::Bitcoin] {
+            let prior = Checkpoint::open(dir.path(), network, old.clone()).unwrap();
+            prior
+                .store(old.height, old.block_hash, &old_stump, true)
+                .unwrap();
+            let extended = Checkpoint::open(dir.path(), network, later.clone()).unwrap();
+            let recovered = extended.recover(|h| (h == old.height).then_some(old.block_hash));
+            if network == Network::Bitcoin {
+                assert!(recovered.is_err(), "a released assumption cannot move");
+                continue;
+            }
+            assert_eq!(recovered.unwrap(), (old.height, old_stump.clone(), false));
+            assert!(extended.recover(|_| Some(later.block_hash)).is_err());
+            assert!(extended
+                .store(later.height, later.block_hash, &old_stump, true)
+                .is_err());
+            let switched = Checkpoint::open(dir.path(), Network::Testnet, later.clone()).unwrap();
+            assert!(switched.recover(|_| Some(old.block_hash)).is_err());
+
+            // A completed target at the same height with a different accumulator is unsafe.
+            let mut changed = old.clone();
+            changed.roots.clone_from(&later.roots);
+            let wrong = Checkpoint::open(dir.path(), network, changed).unwrap();
+            assert!(wrong.recover(|_| Some(old.block_hash)).is_err());
+
+            prior
+                .store(1, old.block_hash, &Stump::default(), false)
+                .unwrap();
+            assert!(extended.recover(|_| Some(old.block_hash)).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_legacy_unbound_authentication_and_malformed_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = anchor();
+        let old_stump = Stump {
+            leaves: old.leaves,
+            roots: old.roots.clone(),
+        };
+        let previous = Checkpoint::open(dir.path(), Network::Regtest, old.clone()).unwrap();
+        previous
+            .store(old.height, old.block_hash, &old_stump, true)
+            .unwrap();
+        let mut later = old.clone();
+        later.height += 1;
+        let reopened = Checkpoint::open(dir.path(), Network::Regtest, later).unwrap();
+        let signed = std::fs::read(&previous.path).unwrap();
+        let body = &signed[MAC_SIZE..];
+        let key = std::fs::read(dir.path().join(KEY_FILE)).unwrap();
+        let mut legacy = HmacEngine::<sha256::Hash>::new(&key);
+        legacy.input(body);
+        let mut old_tag = Hmac::from_engine(legacy).to_byte_array().to_vec();
+        old_tag.extend(body);
+        std::fs::write(&previous.path, old_tag).unwrap();
+        assert!(reopened.recover(|_| Some(old.block_hash)).is_err());
+
+        let mut record: Record = serde_json::from_slice(body).unwrap();
+        record.anchor = [12; 32];
+        let corrupt = serde_json::to_vec(&record).unwrap();
+        let mut signed_bad = previous.tag(&corrupt).to_vec();
+        signed_bad.extend(corrupt);
+        std::fs::write(&previous.path, signed_bad).unwrap();
+        assert!(reopened.recover(|_| Some(old.block_hash)).is_err());
     }
 
     #[test]
