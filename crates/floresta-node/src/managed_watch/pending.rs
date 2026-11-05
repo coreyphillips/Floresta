@@ -335,6 +335,76 @@ impl Pool {
         Ok(())
     }
 
+    pub(super) fn transaction(
+        &mut self,
+        owner: &Owner,
+        chain: &impl BlockchainInterface,
+        txid: Txid,
+        offset: u32,
+    ) -> Result<Value> {
+        use bitcoin::hex::DisplayHex;
+        self.reconcile(chain);
+        let unavailable = || json!({"phase":"unavailable"});
+        let Some(tip) = self.anchor else {
+            return Ok(unavailable());
+        };
+        if owner.cursor != Some(tip) || owner.unavailable || owner.has_missing_parents()? {
+            return Ok(unavailable());
+        }
+        let Some(entry) = self.entries.get(&txid) else {
+            return Ok(unavailable());
+        };
+        // A direct pending parent can be needed for a wallet spend. Broader
+        // ancestry and unrelated pending transactions stay outside this grant.
+        let relevant = |id: Txid, e: &Entry| {
+            e.tx.input.iter().zip(&e.inputs).any(|(i, o)| {
+                owner.watches.outpoints.contains(&i.previous_output)
+                    || owner.watches.scripts.contains(&o.script_pubkey)
+            }) || e.tx.output.iter().enumerate().any(|(vout, o)| {
+                owner.watches.scripts.contains(&o.script_pubkey)
+                    || owner
+                        .watches
+                        .outpoints
+                        .contains(&OutPoint::new(id, vout as u32))
+            })
+        };
+        if !relevant(txid, entry)
+            && !(0..entry.tx.output.len()).any(|vout| {
+                self.spent
+                    .get(&OutPoint::new(txid, vout as u32))
+                    .is_some_and(|child| {
+                        self.entries.get(child).is_some_and(|e| relevant(*child, e))
+                    })
+            })
+        {
+            return Ok(unavailable());
+        }
+        let size = entry.tx.total_size();
+        if offset as usize >= size || offset % super::REPLY_BYTES != 0 {
+            return Err("Invalid transaction offset.");
+        }
+        let raw = bitcoin::consensus::serialize(&entry.tx);
+        let end = (offset as usize + super::REPLY_BYTES as usize).min(size);
+        let chunk = raw[offset as usize..end].to_lower_hex_string();
+        let height = if entry
+            .tx
+            .input
+            .iter()
+            .any(|i| self.entries.contains_key(&i.previous_output.txid))
+        {
+            -1
+        } else {
+            0
+        };
+        if !active(chain, tip) {
+            return Ok(unavailable());
+        }
+        Ok(
+            json!({"phase":"observed-transaction","coverageComplete":false,"txid":txid,"wtxid":entry.tx.compute_wtxid(),
+            "tipHeight":tip.0,"tipHash":tip.1,"revision":self.revision,"height":height,"fee":entry.fee,"size":size,"offset":offset,"chunk":chunk}),
+        )
+    }
+
     pub(super) fn page(
         &mut self,
         owner: &Owner,

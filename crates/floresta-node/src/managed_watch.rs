@@ -223,7 +223,7 @@ impl Registry {
             owner.reconcile(chain)?;
             return confirmed::page(owner, chain, query);
         }
-        if request.action == "transaction" {
+        if matches!(request.action.as_str(), "transaction" | "pending-transaction") {
             if !request.scripts.is_empty()
                 || !request.outpoints.is_empty()
                 || !request.descriptors.is_empty()
@@ -236,6 +236,9 @@ impl Registry {
                 return Ok(json!({"phase":"unavailable"}));
             };
             owner.reconcile(chain)?;
+            if request.action == "pending-transaction" {
+                return self.pool.lock().map_err(storage)?.transaction(owner, chain, txid, offset);
+            }
             return owner.transaction(chain, txid, offset);
         }
         if request.txid.is_some() || request.offset.is_some() {
