@@ -24,6 +24,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::io::IsTerminal;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
@@ -62,7 +63,42 @@ fn main() {
         exit(1);
     });
 
+    // Managed control never binds a TCP socket. Refuse a build with auxiliary listeners.
+    let managed = params.managed_stdio;
+    if managed
+        && (!cfg!(feature = "compact-filters")
+            || cfg!(any(
+                feature = "json-rpc",
+                feature = "metrics",
+                feature = "zmq-server",
+                feature = "tokio-console"
+            )))
+    {
+        eprintln!("Managed mode requires a compact-filters build without public control services.");
+        exit(1);
+    }
+    // Hold the kernel lock in the daemon. A parent crash cannot release a live child's
+    // store and a dead process leaves no stale PID to trust or remove.
+    let _managed_lock = managed.then(|| {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(&data_dir).join("chicory-managed.lock"))
+            .unwrap_or_else(|_| {
+                eprintln!("Could not open the managed data lock.");
+                exit(1)
+            });
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap_or_else(|_| {
+            eprintln!("Managed data directory is already in use.");
+            exit(73)
+        });
+        lock
+    });
+
     let config = Config {
+        managed_stdio: managed,
         data_dir,
         disable_dns_seeds: params.connect.is_some() || params.disable_dns_seeds,
         network: params.network,
@@ -74,9 +110,9 @@ fn main() {
         wallet_xpub: params.wallet_xpub,
         config_file: params.config_file,
         #[cfg(unix)]
-        log_to_stdout: !params.daemon,
+        log_to_stdout: !params.daemon && !managed,
         #[cfg(not(unix))]
-        log_to_stdout: true,
+        log_to_stdout: !managed,
         #[cfg(unix)]
         log_to_file: params.log_to_file || params.daemon,
         #[cfg(not(unix))]
@@ -91,7 +127,11 @@ fn main() {
         filters_start_height: params.filters_start_height,
         user_agent: env!("USER_AGENT").to_owned(),
         assumeutreexo_value: None,
-        electrum_address: params.electrum_address,
+        electrum_address: if managed {
+            Some("127.0.0.1:0".into())
+        } else {
+            params.electrum_address
+        },
         enable_electrum_tls: params.enable_electrum_tls,
         electrum_address_tls: params.electrum_address_tls,
         tls_cert_path: params.tls_cert_path,
@@ -133,6 +173,15 @@ fn main() {
 
     let signal = Arc::new(RwLock::new(false));
     let _signal = signal.clone();
+    if managed {
+        // EOF means the owner quit or crashed. Version 1 accepts no commands.
+        // Use a dedicated OS thread so an open pipe cannot stall Tokio shutdown.
+        let owner = signal.clone();
+        std::thread::spawn(move || {
+            let _ = io::stdin().lock().read_exact(&mut [0]);
+            *owner.blocking_write() = true;
+        });
+    }
 
     _rt.spawn(async move {
         // This is used to signal the runtime to stop gracefully.
@@ -158,7 +207,12 @@ fn main() {
                 break;
             }
 
-            sleep(Duration::from_secs(5)).await;
+            sleep(if managed {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_secs(5)
+            })
+            .await;
         }
     });
 

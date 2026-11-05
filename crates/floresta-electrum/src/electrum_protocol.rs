@@ -170,6 +170,9 @@ pub enum Message {
 }
 
 pub struct ElectrumServer<Blockchain: BlockchainInterface> {
+    // Chain-only managed instances do not accept wallet queries, broadcasts or watch mutations.
+    chain_only: bool,
+
     /// The blockchain backend we are using. This will be used to query
     /// blockchain information and broadcast transactions.
     chain: Arc<Blockchain>,
@@ -226,6 +229,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         let (tx, rx) = unbounded_channel();
 
         Ok(ElectrumServer {
+            chain_only: false,
             last_rebroadcast: None,
             chain,
             address_cache,
@@ -237,6 +241,11 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             client_addresses: HashMap::new(),
             addresses_to_scan: Vec::new(),
         })
+    }
+
+    /// Restrict an unqualified managed listener to public chain health checks.
+    pub fn restrict_to_chain_health(&mut self) {
+        self.chain_only = true;
     }
 
     /// Notifier to send messages to the main loop
@@ -251,6 +260,14 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         client: Arc<Client>,
         request: Request,
     ) -> Result<Value, super::error::Error> {
+        if self.chain_only
+            && !matches!(
+                request.method.as_str(),
+                "server.version" | "server.ping" | "blockchain.block.header"
+            )
+        {
+            return Err(super::error::Error::InvalidParams);
+        }
         // Methods are in alphabetical order
         match request.method.as_str() {
             "blockchain.block.header" => {

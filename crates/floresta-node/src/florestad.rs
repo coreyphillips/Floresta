@@ -14,7 +14,6 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 pub use bitcoin::Network;
-#[cfg(feature = "zmq-server")]
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
@@ -78,6 +77,9 @@ const DEFAULT_MEMPOOL_MAX_SIZE_BYTES: usize = 300_000_000; // 300 MiB
 /// Those configs should be passed in by anyone that wants to start a floresta instance. Some of
 /// these are also exposed through the config file.
 pub struct Config {
+    /// Emit private status on the inherited stdout pipe for the desktop supervisor.
+    pub managed_stdio: bool,
+
     /// Whether we should disable dns seeds
     pub disable_dns_seeds: bool,
 
@@ -227,6 +229,7 @@ impl Config {
             data_dir,
             assume_valid: AssumeValidArg::Hardcoded,
             wallet_xpub: None,
+            managed_stdio: false,
             wallet_descriptor: None,
             config_file: None,
             proxy: None,
@@ -370,7 +373,10 @@ impl Florestad {
             .map_err(FlorestadError::CouldNotInitializeWallet)?;
 
         // Try to add more wallets to watch if needed
-        self.setup_wallet(data_dir, &mut wallet)?;
+        // The managed chain-only profile accepts no wallet keys, configuration file or watches.
+        if !self.config.managed_stdio {
+            self.setup_wallet(data_dir, &mut wallet)?;
+        }
 
         info!("Loading blockchain database");
         let blockchain_state = Arc::new(Self::load_chain_state(
@@ -489,9 +495,9 @@ impl Florestad {
         // Electrum Server configuration.
 
         // Instantiate the Electrum Server.
-        let electrum_server = ElectrumServer::new(
+        let mut electrum_server = ElectrumServer::new(
             wallet,
-            blockchain_state,
+            blockchain_state.clone(),
             cfilters,
             chain_provider.get_handle(),
         )
@@ -519,6 +525,34 @@ impl Florestad {
             .map(Arc::new)
             .map_err(FlorestadError::FailedToBindElectrumServer)?;
 
+        if self.config.managed_stdio {
+            electrum_server.restrict_to_chain_health();
+            let endpoint = non_tls_listener.local_addr()?;
+            let chain = blockchain_state.clone();
+            let network = self.config.network;
+            let genesis = chain
+                .get_block_hash(0)
+                .map_err(FlorestadError::Blockchain)?;
+            task::spawn(async move {
+                use std::io::Write;
+                loop {
+                    let (Ok((height, tip)), Ok(validated)) =
+                        (chain.get_best_block(), chain.get_validation_index())
+                    else {
+                        break;
+                    };
+                    let status = serde_json::json!({
+                        "protocol": "chicory.floresta/1", "network": network.to_string(),
+                        "endpoint": endpoint.to_string(), "genesis": genesis.to_string(),
+                        "height": height, "tip": tip.to_string(), "validated": validated, "ibd": chain.is_in_ibd()
+                    });
+                    if writeln!(std::io::stdout().lock(), "{status}").is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+        }
         task::spawn(client_accept_loop(
             non_tls_listener,
             electrum_server.get_notifier(),

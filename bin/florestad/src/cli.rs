@@ -15,6 +15,11 @@ use floresta_node::AssumeValidArg;
     long_about = env!("LONG_VERSION"),
 )]
 pub struct Cli {
+    /// Use Chicory's inherited control pipe and an ephemeral loopback Electrum listener.
+    #[arg(long, requires = "data_dir", conflicts_with_all = ["rpc_address", "electrum_address", "enable_electrum_tls", "config_file", "wallet_descriptor", "wallet_xpub", "log_to_file", "debug", "no_cfilters", "no_assume_utreexo", "no_backfill"])]
+    #[cfg_attr(unix, arg(conflicts_with = "daemon"))]
+    pub managed_stdio: bool,
+
     #[arg(long, default_value_t = false)]
     /// Whether to disable DNS seeds
     pub disable_dns_seeds: bool,

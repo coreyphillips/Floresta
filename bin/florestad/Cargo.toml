@@ -23,6 +23,7 @@ bitcoin = { workspace = true }
 clap = { workspace = true, features = ["help"] }
 console-subscriber = { workspace = true, optional = true }
 dirs = { version = "4.0", default-features = false }
+fs2 = "0.4.3"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { version = "0.2", default-features = false }
