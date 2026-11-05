@@ -11,15 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{Block, BlockHash, Network, OutPoint, ScriptBuf};
+use bitcoin::consensus::encode::{serialize, serialize_hex};
+use bitcoin::{Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, Txid, Wtxid};
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_watch_only::merkle::MerkleProof;
 use floresta_wire::node_interface::NodeInterface;
 use miniscript::descriptor::Wildcard;
 use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 const LIMIT: usize = 65536;
@@ -45,6 +45,10 @@ struct Command {
     descriptors: Vec<PublicRange>,
     #[serde(default)]
     outpoints: Vec<OutPoint>,
+    #[serde(default)]
+    txid: Option<Txid>,
+    #[serde(default)]
+    offset: Option<u32>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -100,6 +104,7 @@ struct Owner {
     watches: Watches,
     tree: sled::Tree,
     cursor: Option<Cursor>,
+    parent_cursor: Option<Cursor>,
     unavailable: bool,
     matched: u64,
 }
@@ -148,16 +153,27 @@ impl Registry {
                 .transpose()
                 .map_err(storage)?
                 .unwrap_or(0);
-            owners.insert(
-                id.to_string(),
-                Owner {
-                    watches,
-                    tree,
-                    cursor,
-                    matched,
-                    unavailable: false,
-                },
-            );
+            let parent_cursor = tree
+                .get(b"parent-cursor")
+                .map_err(storage)?
+                .map(|v| serde_json::from_slice(&v))
+                .transpose()
+                .map_err(storage)?;
+            let version = tree.get(b"proof-format").map_err(storage)?;
+            let mut owner = Owner {
+                watches,
+                tree,
+                cursor,
+                parent_cursor,
+                matched,
+                unavailable: false,
+            };
+            match version.as_deref() {
+                Some(b"1") => (),
+                None => owner.reset_to(owner.watches.clone())?,
+                _ => return Err("Unsupported managed proof index format."),
+            }
+            owners.insert(id.to_string(), owner);
         }
         Ok(Self { db, owners })
     }
@@ -170,6 +186,24 @@ impl Registry {
     ) -> Result<Value> {
         if !owner_id(&request.owner) {
             return Err("Invalid watch owner.");
+        }
+        if request.action == "transaction" {
+            if !request.scripts.is_empty()
+                || !request.outpoints.is_empty()
+                || !request.descriptors.is_empty()
+            {
+                return Err("Invalid transaction request.");
+            }
+            let txid = request.txid.ok_or("Missing transaction id.")?;
+            let offset = request.offset.ok_or("Missing transaction offset.")?;
+            let Some(owner) = self.owners.get_mut(&request.owner) else {
+                return Ok(json!({"phase":"unavailable"}));
+            };
+            owner.reconcile(chain)?;
+            return owner.transaction(chain, txid, offset);
+        }
+        if request.txid.is_some() || request.offset.is_some() {
+            return Err("Unexpected transaction fields.");
         }
         match request.action.as_str() {
             "register" => {
@@ -194,6 +228,7 @@ impl Registry {
                         watches: Watches::default(),
                         tree,
                         cursor: None,
+                        parent_cursor: None,
                         matched: 0,
                         unavailable: false,
                     });
@@ -233,9 +268,12 @@ impl Registry {
             && chain.get_best_block().ok() == owner.cursor
             && chain.get_validation_index().ok() == owner.cursor.map(|c| c.0)
             && !chain.is_in_ibd();
-        let phase = if owner.unavailable {
+        let parents_pending = owner.has_missing_parents()?;
+        let exhausted =
+            parents_pending && owner.parent_cursor.is_some() && owner.parent_cursor == owner.cursor;
+        let phase = if owner.unavailable || exhausted {
             "unavailable"
-        } else if caught_up {
+        } else if caught_up && !parents_pending {
             "caught-up"
         } else if owner.cursor.is_none() {
             "registered"
@@ -258,11 +296,13 @@ impl Owner {
         for key in self.tree.iter().keys() {
             batch.remove(key.map_err(storage)?);
         }
+        batch.insert(b"proof-format", &b"1"[..]);
         batch.insert(b"watches", serde_json::to_vec(&watches).map_err(storage)?);
         self.tree.apply_batch(batch).map_err(storage)?;
         self.tree.flush().map_err(storage)?;
         self.watches = watches;
         self.cursor = None;
+        self.parent_cursor = None;
         self.matched = 0;
         self.unavailable = false;
         Ok(())
@@ -287,6 +327,8 @@ impl Owner {
         let mut batch = sled::Batch::default();
         let mut found = HashSet::new();
         let mut matched = self.matched;
+        let mut parents = HashSet::new();
+        let mut stored = HashSet::new();
         for (position, tx) in block.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
             let mut relevant = false;
@@ -314,23 +356,191 @@ impl Owner {
             }
             if relevant {
                 matched += 1;
-                let record = json!({ "height":height, "block":block.block_hash(), "hex":serialize_hex(tx),
-                    "proof":MerkleProof::from_block(block, position as u64) });
-                batch.insert(
-                    format!("tx/{height:08x}/{position:08x}").as_bytes(),
-                    serde_json::to_vec(&record).map_err(storage)?,
-                );
+                if !tx.is_coinbase() {
+                    parents.extend(tx.input.iter().map(|input| input.previous_output.txid));
+                }
+                save_proof(&mut batch, block, height, position, tx)?;
+                stored.insert(txid);
             }
+        }
+        // The parent's position may precede the match in this same block.
+        // Capture such a parent without another network request. Never follow
+        // the inputs of a transaction stored solely as somebody else's parent.
+        if !parents.is_empty() {
+            for (position, tx) in block.txdata.iter().enumerate() {
+                let txid = tx.compute_txid();
+                if parents.contains(&txid) && !stored.contains(&txid) {
+                    save_proof(&mut batch, block, height, position, tx)?;
+                    stored.insert(txid);
+                }
+            }
+        }
+        let mut reset_parent_cursor = false;
+        for txid in parents {
+            let missing = format!("need/{txid}");
+            if !stored.contains(&txid)
+                && !self
+                    .tree
+                    .contains_key(format!("proof/{txid}"))
+                    .map_err(storage)?
+                && !self.tree.contains_key(&missing).map_err(storage)?
+            {
+                batch.insert(missing.as_bytes(), &[]);
+                reset_parent_cursor = true;
+            }
+        }
+        if reset_parent_cursor {
+            batch.remove(b"parent-cursor");
         }
         let cursor = (height, block.block_hash());
         batch.insert(b"matches", serde_json::to_vec(&matched).map_err(storage)?);
         batch.insert(b"cursor", serde_json::to_vec(&cursor).map_err(storage)?);
         self.tree.apply_batch(batch).map_err(storage)?;
         self.cursor = Some(cursor);
+        if reset_parent_cursor {
+            self.parent_cursor = None;
+        }
         self.matched = matched;
         self.unavailable = false;
         Ok(())
     }
+
+    fn has_missing_parents(&self) -> Result<bool> {
+        Ok(self
+            .tree
+            .scan_prefix(b"need/")
+            .next()
+            .transpose()
+            .map_err(storage)?
+            .is_some())
+    }
+
+    fn next_height(&self, target: u32) -> Result<Option<u32>> {
+        let next = self.cursor.map_or(0, |c| c.0.saturating_add(1));
+        if next <= target {
+            return Ok(Some(next));
+        }
+        let replay = self.parent_cursor.map_or(0, |c| c.0.saturating_add(1));
+        Ok((replay <= target && self.has_missing_parents()?).then_some(replay))
+    }
+
+    fn replay(&mut self, height: u32, block: &Block) -> Result<()> {
+        let mut batch = sled::Batch::default();
+        for (position, tx) in block.txdata.iter().enumerate() {
+            if self
+                .tree
+                .contains_key(format!("need/{}", tx.compute_txid()))
+                .map_err(storage)?
+            {
+                save_proof(&mut batch, block, height, position, tx)?;
+            }
+        }
+        let cursor = (height, block.block_hash());
+        batch.insert(
+            b"parent-cursor",
+            serde_json::to_vec(&cursor).map_err(storage)?,
+        );
+        self.tree.apply_batch(batch).map_err(storage)?;
+        self.parent_cursor = Some(cursor);
+        self.unavailable = false;
+        Ok(())
+    }
+
+    fn transaction(
+        &self,
+        chain: &impl BlockchainInterface,
+        txid: Txid,
+        offset: u32,
+    ) -> Result<Value> {
+        let unavailable = || json!({"phase":"unavailable"});
+        let tip = chain.get_best_block().map_err(storage)?;
+        if self.cursor != Some(tip)
+            || chain.get_validation_index().ok() != Some(tip.0)
+            || chain.is_in_ibd()
+        {
+            return Ok(unavailable());
+        }
+        let Some(bytes) = self.tree.get(format!("proof/{txid}")).map_err(storage)? else {
+            return Ok(unavailable());
+        };
+        let meta: ProofRecord = serde_json::from_slice(&bytes).map_err(storage)?;
+        if meta.height > tip.0 || chain.get_block_hash(meta.height).ok() != Some(meta.block) {
+            return Ok(unavailable());
+        }
+        let header = chain.get_block_header(&meta.block).map_err(storage)?;
+        if header.block_hash() != meta.block
+            || meta.proof.target != txid
+            || !meta
+                .proof
+                .verify(header.merkle_root.to_raw_hash())
+                .map_err(storage)?
+        {
+            return Err("Invalid indexed transaction proof.");
+        }
+        if offset >= meta.size || offset % REPLY_BYTES != 0 {
+            return Err("Invalid transaction offset.");
+        }
+        let page = self
+            .tree
+            .get(format!("raw/{txid}/{}", offset / PAGE_BYTES))
+            .map_err(storage)?
+            .ok_or("Missing indexed transaction page.")?;
+        let start = (offset % PAGE_BYTES) as usize;
+        let n = REPLY_BYTES.min(meta.size - offset) as usize;
+        let chunk = page
+            .get(start..start + n)
+            .ok_or("Invalid indexed transaction page.")?;
+        if chain.get_best_block().ok() != Some(tip)
+            || chain.get_validation_index().ok() != Some(tip.0)
+        {
+            return Ok(unavailable());
+        }
+        use bitcoin::hex::DisplayHex;
+        Ok(
+            json!({ "phase":"confirmed", "txid":txid, "height":meta.height, "blockHash":meta.block,
+            "tipHeight":tip.0, "tipHash":tip.1, "header":serialize_hex(&header), "position":meta.proof.pos,
+            "merkle":meta.proof.hashes, "wtxid":meta.wtxid, "size":meta.size, "offset":offset, "chunk":chunk.to_lower_hex_string() }),
+        )
+    }
+}
+
+const REPLY_BYTES: u32 = 512;
+const PAGE_BYTES: u32 = 16384;
+
+#[derive(Serialize, Deserialize)]
+struct ProofRecord {
+    height: u32,
+    block: BlockHash,
+    size: u32,
+    wtxid: Wtxid,
+    proof: MerkleProof,
+}
+
+fn save_proof(
+    batch: &mut sled::Batch,
+    block: &Block,
+    height: u32,
+    position: usize,
+    tx: &Transaction,
+) -> Result<()> {
+    let txid = tx.compute_txid();
+    let raw = serialize(tx);
+    let record = ProofRecord {
+        height,
+        block: block.block_hash(),
+        size: raw.len() as u32,
+        wtxid: tx.compute_wtxid(),
+        proof: MerkleProof::from_block(block, position as u64),
+    };
+    batch.insert(
+        format!("proof/{txid}").as_bytes(),
+        serde_json::to_vec(&record).map_err(storage)?,
+    );
+    for (i, chunk) in raw.chunks(PAGE_BYTES as usize).enumerate() {
+        batch.insert(format!("raw/{txid}/{i}").as_bytes(), chunk);
+    }
+    batch.remove(format!("need/{txid}").as_bytes());
+    Ok(())
 }
 
 fn verified_block(block: &Block, hash: BlockHash) -> bool {
@@ -361,8 +571,7 @@ async fn scan(
         let mut next = None;
         for owner in registry.owners.values_mut() {
             owner.reconcile(chain)?;
-            let height = owner.cursor.map_or(0, |c| c.0.saturating_add(1));
-            if height <= target {
+            if let Some(height) = owner.next_height(target)? {
                 next = Some(next.map_or(height, |n: u32| n.min(height)));
             }
         }
@@ -391,17 +600,25 @@ async fn scan(
         return Ok(false);
     }
     for owner in registry.owners.values_mut() {
-        if owner.cursor.map_or(0, |c| c.0.saturating_add(1)) != height {
+        owner.reconcile(chain)?;
+        if owner.next_height(target)? != Some(height) {
             continue;
         }
         if let Some(block) = &block {
-            if owner
-                .cursor
-                .is_some_and(|(_, previous)| previous != block.header.prev_blockhash)
-            {
+            let primary = owner.cursor.map_or(0, |c| c.0.saturating_add(1)) == height;
+            let previous = if primary {
+                owner.cursor
+            } else {
+                owner.parent_cursor
+            };
+            if previous.is_some_and(|(_, previous)| previous != block.header.prev_blockhash) {
                 continue;
             }
-            owner.apply(height, block)?;
+            if primary {
+                owner.apply(height, block)?;
+            } else {
+                owner.replay(height, block)?;
+            }
         } else {
             owner.unavailable = true;
         }
