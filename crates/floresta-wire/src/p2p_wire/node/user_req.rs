@@ -32,7 +32,9 @@ where
     /// multiple handles. It also doesn't require a mutable reference to the node, or any
     /// synchronization mechanism.
     pub fn get_handle(&self) -> NodeInterface {
-        NodeInterface::new(self.common.node_tx.clone())
+        let mut interface = NodeInterface::new(self.common.node_tx.clone());
+        interface.managed_relay = self.config.managed_relay.clone();
+        interface
     }
 
     /// Handles getpeerinfo requests, returning a list of all connected peers and some useful

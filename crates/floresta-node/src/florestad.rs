@@ -425,6 +425,8 @@ impl Florestad {
         let historical = self.config.managed_stdio.then(floresta_wire::Historical::default);
         let config = UtreexoNodeConfig {
             historical: historical.clone(),
+            managed_relay: floresta_wire::proven_tx::Relay::for_config(self.config.managed_stdio,
+                self.config.network,self.config.connect.as_deref(),proxy.is_some()),
             disable_dns_seeds: self.config.disable_dns_seeds,
             network: self.config.network,
             pow_fraud_proofs: false,

@@ -37,6 +37,7 @@ pub use p2p_wire::node_context;
 pub use p2p_wire::node_interface;
 pub use p2p_wire::transport::TransportProtocol;
 pub use p2p_wire::historical::Historical;
+pub use p2p_wire::proven_tx;
 pub use p2p_wire::UtreexoNodeConfig;
 
 /// NodeHooks is a trait that defines the hooks that a node can use to interact with the network

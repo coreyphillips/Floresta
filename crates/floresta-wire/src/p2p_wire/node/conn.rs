@@ -209,6 +209,7 @@ where
                         .expect("infallible in ChainState")
                         .0,
                     allow_v1_fallback,
+                    self.config.managed_relay.clone(),
                 ),
             ));
         }
@@ -272,8 +273,9 @@ where
         our_user_agent: String,
         our_best_block: u32,
         allow_v1_fallback: bool,
+        managed_relay: Option<crate::proven_tx::Relay>,
     ) -> Result<(), WireError> {
-        let (transport_reader, transport_writer, transport_protocol) = transport::connect(
+        let (transport_reader, transport_writer, transport_protocol, actual) = transport::connect(
             (peer_address.get_net_address(), peer_address.get_port()),
             network,
             allow_v1_fallback,
@@ -303,6 +305,7 @@ where
             our_best_block,
             cancellation_sender,
             transport_protocol,
+            managed_relay.and_then(|relay| relay.bind(network, actual)),
         );
 
         Ok(())
@@ -349,6 +352,7 @@ where
             our_best_block,
             cancellation_sender,
             transport_protocol,
+            None,
         );
         Ok(())
     }

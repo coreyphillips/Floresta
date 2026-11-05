@@ -159,6 +159,7 @@ pub enum NodeResponse {
 /// This struct will be used by consumers to interact with the node. You may have as many of it as
 /// you need, and you can use it to send requests to the node and get responses back.
 pub struct NodeInterface {
+    pub(crate) managed_relay: Option<crate::proven_tx::Relay>,
     node_sender: UnboundedSender<NodeNotification>,
 }
 
@@ -171,7 +172,19 @@ pub struct RequestData {
 
 impl NodeInterface {
     pub fn new(node_sender: UnboundedSender<NodeNotification>) -> Self {
-        NodeInterface { node_sender }
+        NodeInterface {
+            node_sender,
+            managed_relay: None,
+        }
+    }
+
+    /// Take bounded, untrusted wire candidates. The caller must verify the complete
+    /// accumulator proof and script policy at its still-active validated tip.
+    pub fn drain_proven_transactions(&self) -> Vec<crate::proven_tx::Candidate> {
+        self.managed_relay
+            .as_ref()
+            .map(|relay| relay.drain())
+            .unwrap_or_default()
     }
 
     /// Sends a request to the node.

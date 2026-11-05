@@ -228,8 +228,10 @@ where
         }
 
         let chain = self.chain.get_partial_chain(height, anchor.height, stump)?;
+        let mut replay_config = self.config.clone();
+        replay_config.managed_relay = None;
         let mut node = UtreexoNode::<PartialChainState, SyncNode>::new(
-            self.config.clone(),
+            replay_config,
             chain,
             self.mempool.clone(),
             None,
@@ -525,6 +527,13 @@ where
 
         // Jobs that don't need a connected peer
         try_and_log!(self.process_pending_blocks());
+        if let Some(relay) = &self.config.managed_relay {
+            let current = self.chain.get_best_block().ok().and_then(|(height, hash)| {
+                (!self.chain.is_in_ibd() && self.chain.get_validation_index().ok() == Some(height))
+                    .then(|| (height, hash, self.chain.get_acc().leaves))
+            });
+            relay.tip(current);
+        }
 
         // Save our peers db
         periodic_job!(

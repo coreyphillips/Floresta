@@ -51,6 +51,8 @@ pub struct UtreexoNodeConfig {
     pub backfill: bool,
     /// Managed historical verification status shared with the inherited control channel.
     pub historical: Option<historical::Historical>,
+    /// In-process intake of untrusted peer transaction candidates for the managed validator.
+    pub managed_relay: Option<proven_tx::Relay>,
     /// If we are using network-provided block filters, we may not need to download the whole
     /// chain of filters, as our wallets may not have been created at the beginning of the chain.
     /// With this option, we can make a rough estimate of the block height we need to start
@@ -82,6 +84,7 @@ impl Default for UtreexoNodeConfig {
             proxy: None,
             backfill: false,
             historical: None,
+            managed_relay: None,
             assume_utreexo: None,
             filter_start_height: None,
             user_agent: format!("floresta:{}", env!("CARGO_PKG_VERSION")),
@@ -98,6 +101,7 @@ pub mod node;
 pub mod node_context;
 pub mod node_interface;
 pub mod peer;
+pub mod proven_tx;
 pub mod socks;
 #[cfg(test)]
 #[doc(hidden)]

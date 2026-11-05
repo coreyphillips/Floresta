@@ -53,6 +53,15 @@ use crate::address_man::LocalAddress;
 
 type TcpReadTransport = ReadTransport<BufReader<ReadHalf<TcpStream>>>;
 type TcpWriteTransport = WriteTransport<WriteHalf<TcpStream>>;
+type DirectTransportResult = Result<
+    (
+        TcpReadTransport,
+        TcpWriteTransport,
+        TransportProtocol,
+        Option<std::net::SocketAddr>,
+    ),
+    TransportError,
+>;
 type TransportResult =
     Result<(TcpReadTransport, TcpWriteTransport, TransportProtocol), TransportError>;
 
@@ -234,7 +243,7 @@ pub async fn connect<A: ToSocketAddrs>(
     address: A,
     network: Network,
     allow_v1_fallback: bool,
-) -> TransportResult {
+) -> DirectTransportResult {
     match try_connection(&address, network, false).await {
         Ok(transport) => Ok(transport),
         Err(TransportError::Protocol(ProtocolError::Io(_, ProtocolFailureSuggestion::RetryV1)))
@@ -250,16 +259,17 @@ async fn try_connection<A: ToSocketAddrs>(
     address: &A,
     network: Network,
     force_v1: bool,
-) -> TransportResult {
+) -> DirectTransportResult {
     let tcp_stream = TcpStream::connect(address).await?;
     // Data is buffered until there is enough to send out
     // thus reducing the amount of packages going through
     // the network.
     tcp_stream.set_nodelay(false)?;
 
-    let peer_addr = match tcp_stream.peer_addr() {
-        Ok(addr) => addr.to_string(),
-        Err(_) => String::from("unknown peer"),
+    let actual = tcp_stream.peer_addr().ok();
+    let peer_addr = match actual {
+        Some(addr) => addr.to_string(),
+        None => String::from("unknown peer"),
     };
     let (reader, writer) = tokio::io::split(tcp_stream);
     let reader = BufReader::new(reader);
@@ -271,6 +281,7 @@ async fn try_connection<A: ToSocketAddrs>(
                 ReadTransport::V1(reader, network),
                 WriteTransport::V1(writer, network),
                 TransportProtocol::V1,
+                actual,
             ))
         }
         false => match Protocol::new(network, Role::Initiator, None, None, reader, writer).await {
@@ -281,6 +292,7 @@ async fn try_connection<A: ToSocketAddrs>(
                     ReadTransport::V2(reader_protocol),
                     WriteTransport::V2(writer_protocol),
                     TransportProtocol::V2,
+                    actual,
                 ))
             }
             Err(e) => {
@@ -404,6 +416,20 @@ where
                     return Ok(msg);
                 }
 
+                // utreexod assigns BIP324 short type 34 to its proof-bearing transaction.
+                if contents.first() == Some(&34) {
+                    let length = contents.len() - 1;
+                    if length > crate::proven_tx::MAX_BYTES {
+                        return Err(TransportError::OversizedMessage {
+                            max_size: crate::proven_tx::MAX_BYTES,
+                            message_size: length,
+                        });
+                    }
+                    return Ok(NetworkMessage::Unknown {
+                        command: CommandString::try_from_static("utreexotx").unwrap(),
+                        payload: contents[1..].to_vec(),
+                    });
+                }
                 let msg = deserialize_v2(contents)?;
                 Ok(msg)
             }
@@ -412,9 +438,14 @@ where
                 reader.read_exact(&mut data).await?;
 
                 let header: V1MessageHeader = deserialize_partial(&data)?.0;
-                if header.length as usize > MAX_MSG_SIZE {
+                let max_size = if header.command == *b"utreexotx\0\0\0" {
+                    crate::proven_tx::MAX_BYTES
+                } else {
+                    MAX_MSG_SIZE
+                };
+                if header.length as usize > max_size {
                     return Err(TransportError::OversizedMessage {
-                        max_size: MAX_MSG_SIZE,
+                        max_size,
                         message_size: header.length as usize,
                     });
                 }
