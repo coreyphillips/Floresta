@@ -17,7 +17,7 @@ use std::time::Duration;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::consensus::encode::{serialize, serialize_hex};
 use bitcoin::{Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, Txid, Wtxid};
-use floresta_chain::pruned_utreexo::BlockchainInterface;
+use floresta_chain::{BlockchainInterface, ChainState, ChainStore};
 use floresta_watch_only::merkle::MerkleProof;
 use floresta_wire::node_interface::NodeInterface;
 use miniscript::descriptor::Wildcard;
@@ -606,15 +606,16 @@ fn verified_block(block: &Block, hash: BlockHash) -> bool {
             == block.txdata.len()
 }
 
-async fn scan(
+async fn scan<S: ChainStore>(
     registry: &Mutex<Registry>,
     network: Network,
-    chain: &impl BlockchainInterface,
+    chain: &ChainState<S>,
     peer: &NodeInterface,
 ) -> Result<bool> {
-    let target = chain
-        .get_validation_index()
-        .map_err(|_| "Chain unavailable.")?;
+    let Some(active) = chain.active_chain_status().map_err(|_| "Chain unavailable.")? else {
+        return Ok(false);
+    };
+    let target = active.validated;
     let next = {
         let mut registry = registry.lock().map_err(storage)?;
         let mut next = None;
@@ -675,10 +676,10 @@ async fn scan(
     Ok(block.is_some())
 }
 
-pub(crate) fn start<C: BlockchainInterface + Send + Sync + 'static>(
+pub(crate) fn start<S: ChainStore + Send + Sync + 'static>(
     data_dir: &str,
     network: Network,
-    chain: Arc<C>,
+    chain: Arc<ChainState<S>>,
     peer: NodeInterface,
     stop: Arc<RwLock<bool>>,
 ) -> io::Result<()> {

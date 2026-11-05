@@ -556,11 +556,14 @@ impl Florestad {
                 .map_err(FlorestadError::Blockchain)?;
             task::spawn(async move {
                 use std::io::Write;
+                let mut ticks = tokio::time::interval(std::time::Duration::from_secs(2));
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    let (Ok((height, tip)), Ok(validated)) =
-                        (chain.get_best_block(), chain.get_validation_index())
-                    else {
-                        break;
+                    ticks.tick().await;
+                    let state = match chain.active_chain_status() {
+                        Ok(Some(state)) => state,
+                        Ok(None) => continue,
+                        Err(_) => break,
                     };
                     let status = serde_json::json!({
                         "protocol": "chicory.floresta/1", "watchProtocol": "chicory.watch/1",
@@ -568,14 +571,13 @@ impl Florestad {
                         "walletOfferProtocol": wallet_offers.then_some("chicory.offer/1"),
                         "pendingProtocol": "chicory.pending/1", "pendingTransactionProtocol": "chicory.pending-tx/1",
                         "network": network.to_string(),
-                        "historical": historical.snapshot(height, validated, chain.is_in_ibd(), |at| chain.get_block_hash(at).ok()),
+                        "historical": historical.snapshot(state.height, state.validated, state.ibd, |at| chain.get_block_hash(at).ok()),
                         "endpoint": endpoint.to_string(), "genesis": genesis.to_string(),
-                        "height": height, "tip": tip.to_string(), "validated": validated, "ibd": chain.is_in_ibd()
+                        "height": state.height, "tip": state.tip.to_string(), "validated": state.validated, "ibd": state.ibd
                     });
                     if writeln!(std::io::stdout().lock(), "{status}").is_err() {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             });
         }

@@ -167,7 +167,53 @@ pub enum AssumeValidArg {
     UserInput(BlockHash),
 }
 
+/// A header tip and its active validated height, read under one chainstate lock.
+pub struct ActiveChainStatus {
+    pub height: u32,
+    pub tip: BlockHash,
+    pub validated: u32,
+    pub ibd: bool,
+}
+
 impl<PersistedState: ChainStore> ChainState<PersistedState> {
+    /// Reorganizations update individual disk headers before replacing BestChain.
+    /// During that interval no managed chain or wallet observer can certify a tip.
+    pub fn active_chain_status(&self) -> Result<Option<ActiveChainStatus>, BlockchainError> {
+        let inner = self.inner.read();
+        let best = &inner.best_block;
+        let stored = inner
+            .chainstore
+            .get_header(&best.validation_index)?
+            .ok_or(BlockchainError::BlockNotPresent)?;
+        let DiskBlockHeader::FullyValid(_, validated) = stored else {
+            return Ok(None);
+        };
+        let tip = if best.best_block == best.validation_index {
+            stored
+        } else {
+            inner
+                .chainstore
+                .get_header(&best.best_block)?
+                .ok_or(BlockchainError::BlockNotPresent)?
+        };
+        if validated > best.depth
+            || matches!(tip, DiskBlockHeader::InFork(_, _))
+            || tip.height() != Some(best.depth)
+            || tip.block_hash() != best.best_block
+            || stored.block_hash() != best.validation_index
+            || inner.chainstore.get_block_hash(validated)? != Some(best.validation_index)
+            || inner.chainstore.get_block_hash(best.depth)? != Some(best.best_block)
+        {
+            return Ok(None);
+        }
+        Ok(Some(ActiveChainStatus {
+            height: best.depth,
+            tip: best.best_block,
+            validated,
+            ibd: inner.ibd,
+        }))
+    }
+
     fn maybe_reindex(&self, potential_tip: &DiskBlockHeader) -> Result<(), BlockchainError> {
         if let DiskBlockHeader::HeadersOnly(_, height) = potential_tip {
             let best_height = self.get_best_block()?.0;
@@ -1743,6 +1789,52 @@ mod test {
         );
 
         assert_eq!(0x1e012fa7, next_target.to_compact_lossy().to_consensus());
+    }
+
+    #[test]
+    fn active_chain_status_retries_a_reorg_between_disk_and_tip_updates() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled);
+        let source: Vec<Vec<&str>> =
+            serde_json::from_str(include_str!("../../testdata/test_reorg.json")).unwrap();
+        let decode = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|b| deserialize_hex(b).unwrap())
+                .collect::<Vec<Block>>()
+        };
+        let original = decode(&source[0]);
+        let fork = decode(&source[1]);
+        for b in &original {
+            chain.accept_header(b.header).unwrap();
+            chain
+                .connect_block(b, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+        for b in &fork[..5] {
+            chain.accept_header(b.header).unwrap();
+        }
+        let status = chain.active_chain_status().unwrap().unwrap();
+        assert_eq!(
+            (status.height, status.validated, status.tip),
+            (10, 10, original[9].block_hash())
+        );
+
+        // Reproduce a real reader between the steps of ChainState::reorg.
+        chain
+            .mark_chain_as_inactive(&original[9].header, original[4].block_hash())
+            .unwrap();
+        assert!(matches!(
+            chain.get_validation_index(),
+            Err(BlockchainError::BadValidationIndex)
+        ));
+        assert!(chain.active_chain_status().unwrap().is_none());
+
+        chain.switch_chain(fork[4].block_hash()).unwrap();
+        let status = chain.active_chain_status().unwrap().unwrap();
+        assert_eq!(
+            (status.height, status.validated, status.tip),
+            (10, 5, fork[4].block_hash())
+        );
     }
 
     #[test]
