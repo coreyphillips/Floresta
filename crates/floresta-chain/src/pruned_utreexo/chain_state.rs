@@ -182,6 +182,15 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
     /// Reorganizations update individual disk headers before replacing BestChain.
     /// During that interval no managed chain or wallet observer can certify a tip.
     pub fn active_chain_status(&self) -> Result<Option<ActiveChainStatus>, BlockchainError> {
+        Ok(self.active_chain_status_at(None)?.map(|(tip, _)| tip))
+    }
+
+    /// Read the requested historical anchor, active tip and validation index in
+    /// one chainstate observation. The caller rejects a missing or detached pin.
+    pub fn active_chain_status_at(
+        &self,
+        anchor_height: Option<u32>,
+    ) -> Result<Option<(ActiveChainStatus, Option<BlockHash>)>, BlockchainError> {
         let inner = self.inner.read();
         let best = &inner.best_block;
         let stored = inner
@@ -209,12 +218,19 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         {
             return Ok(None);
         }
-        Ok(Some(ActiveChainStatus {
-            height: best.depth,
-            tip: best.best_block,
-            validated,
-            ibd: inner.ibd,
-        }))
+        let anchor = match anchor_height {
+            Some(height) if height <= best.depth => inner.chainstore.get_block_hash(height)?,
+            _ => None,
+        };
+        Ok(Some((
+            ActiveChainStatus {
+                height: best.depth,
+                tip: best.best_block,
+                validated,
+                ibd: inner.ibd,
+            },
+            anchor,
+        )))
     }
 
     fn maybe_reindex(&self, potential_tip: &DiskBlockHeader) -> Result<(), BlockchainError> {
@@ -1891,8 +1907,13 @@ mod test {
             Err(BlockchainError::BadValidationIndex)
         ));
         assert!(chain.active_chain_status().unwrap().is_none());
+        assert!(chain.active_chain_status_at(Some(5)).unwrap().is_none());
 
         chain.switch_chain(fork[4].block_hash()).unwrap();
+        let (competing, checkpoint) = chain.active_chain_status_at(Some(10)).unwrap().unwrap();
+        assert_eq!(competing.tip, fork[4].block_hash());
+        assert_eq!(checkpoint, Some(competing.tip));
+        assert_ne!(checkpoint, Some(original[9].block_hash()));
         let status = chain.active_chain_status().unwrap().unwrap();
         assert_eq!(
             (status.height, status.validated, status.tip),

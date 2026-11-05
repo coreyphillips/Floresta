@@ -560,7 +560,8 @@ impl Florestad {
                 ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticks.tick().await;
-                    let state = match chain.active_chain_status() {
+                    let target = historical.target();
+                    let (state, active_anchor) = match chain.active_chain_status_at(target) {
                         Ok(Some(state)) => state,
                         Ok(None) => continue,
                         Err(_) => break,
@@ -571,7 +572,7 @@ impl Florestad {
                         "walletOfferProtocol": wallet_offers.then_some("chicory.offer/1"),
                         "pendingProtocol": "chicory.pending/1", "pendingTransactionProtocol": "chicory.pending-tx/1",
                         "network": network.to_string(),
-                        "historical": historical.snapshot(state.height, state.validated, state.ibd, |at| chain.get_block_hash(at).ok()),
+                        "historical": historical.snapshot(state.height, state.validated, state.ibd, |at| (Some(at) == target).then_some(active_anchor).flatten()),
                         "endpoint": endpoint.to_string(), "genesis": genesis.to_string(),
                         "height": state.height, "tip": state.tip.to_string(), "validated": state.validated, "ibd": state.ibd
                     });

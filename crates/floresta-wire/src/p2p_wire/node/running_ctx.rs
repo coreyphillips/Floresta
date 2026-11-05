@@ -187,8 +187,9 @@ where
         &self,
         status: crate::Historical,
         done: std::sync::mpsc::Sender<()>,
+        fresh_chain: bool,
     ) -> Result<bool, WireError> {
-        use crate::p2p_wire::historical::Checkpoint;
+        use crate::p2p_wire::historical::{Admission, Checkpoint, Fence};
         use floresta_chain::ChainParams;
         use std::io;
         use std::path::Path;
@@ -216,13 +217,24 @@ where
             self.config.network,
             anchor.clone(),
         )?;
-        let (height, stump, complete) = checkpoint
-            .recover(|at| self.chain.get_block_hash(at).ok())
-            .unwrap_or_else(|error| {
-                warn!("Restarting historical validation from genesis: {error}");
-                (0, Stump::default(), false)
-            });
-        status.begin(height, &anchor);
+        let recovered = checkpoint.recover(|at| self.chain.get_block_hash(at).ok());
+        let admission = checkpoint.reserve(
+            fresh_chain,
+            recovered.is_ok(),
+            matches!(&recovered, Ok((_, _, true))),
+        )?;
+        let (mut height, mut stump, mut complete) = recovered.unwrap_or_else(|error| {
+            warn!("Restarting historical validation from genesis: {error}");
+            (0, Stump::default(), false)
+        });
+        // A previous partial replay is still authenticated work. Never retire a
+        // fence merely by reloading an old complete record at the target.
+        if admission.requires_replay() && height >= anchor.height {
+            height = 0;
+            stump = Stump::default();
+            complete = false;
+        }
+        status.begin(height, &anchor, admission);
         if complete || anchor.height == 0 {
             if anchor.height == 0 && !checkpoint.matches(&Stump::default()) {
                 return Err(io::Error::other("Genesis accumulator mismatch").into());
@@ -260,17 +272,20 @@ where
             let stump = chain.get_acc();
             if height < anchor.height {
                 checkpoint.store(height, hash, &stump, false)?;
+                if admission == Admission::Reserved
+                    && *node.kill_signal.read().await
+                    && outer.get_block_hash(anchor.height).ok() == Some(anchor.block_hash)
+                {
+                    checkpoint.fence(Fence::Ready)?;
+                }
                 return Ok(());
             }
-            if height != anchor.height
-                || hash != anchor.block_hash
-                || !checkpoint.matches(&stump)
-                || outer.get_block_hash(height).ok() != Some(hash)
-            {
-                return Err(io::Error::other(
-                    "Replayed accumulator or active header differs from the historical anchor",
-                ));
-            }
+            checkpoint.check_replayed_anchor(
+                height,
+                hash,
+                outer.get_block_hash(height).ok(),
+                &stump,
+            )?;
             for block in chain.list_valid_blocks() {
                 outer
                     .mark_block_as_valid(block.block_hash())
@@ -283,6 +298,7 @@ where
                 ));
             }
             checkpoint.store(height, hash, &stump, true)?;
+            checkpoint.fence(Fence::Ready)?;
             progress.verified();
             Ok::<_, io::Error>(())
         });
@@ -403,6 +419,16 @@ where
     }
 
     pub async fn run(mut self, stop_signal: tokio::sync::oneshot::Sender<()>) {
+        // Capture freshness before examining any peer headers. Losing a fence file
+        // in an established store never creates a fresh fast-start permission.
+        let fresh_chain = self.config.historical.is_some()
+            && self.config.network == bitcoin::Network::Bitcoin
+            && self.chain.get_validation_index().ok() == Some(0)
+            && self.chain.get_best_block().ok()
+                == Some((
+                    0,
+                    bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).block_hash(),
+                ));
         try_and_warn!(self.init_peers());
 
         // Use this node state to Initial Block download
@@ -432,7 +458,7 @@ where
                 info!("Starting backfill task...");
                 match self.config.historical.clone() {
                     Some(status) => self
-                        .managed_backfill(status.clone(), sender)
+                        .managed_backfill(status.clone(), sender, fresh_chain)
                         .unwrap_or_else(|error| {
                             status.fail(&error.to_string());
                             false

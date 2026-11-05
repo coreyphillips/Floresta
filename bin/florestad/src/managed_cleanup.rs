@@ -192,6 +192,8 @@ fn walk(dir: &File, layout: Layout, dev: u64, deleting: bool) -> io::Result<()> 
                             | "chicory-backfill-v1.key.tmp"
                             | "chicory-backfill-v1.state"
                             | "chicory-backfill-v1.state.tmp"
+                            | "chicory-checkpoint-fence-v1"
+                            | "chicory-checkpoint-fence-v1.tmp"
                     )
             }
             Layout::Chain => matches!(
