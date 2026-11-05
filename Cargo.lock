@@ -1209,6 +1209,8 @@ version = "0.5.1"
 dependencies = [
  "bip324",
  "bitcoin",
+ "bitcoin_hashes 0.18.0",
+ "data-encoding",
  "derive_more",
  "dns-lookup",
  "floresta-chain",

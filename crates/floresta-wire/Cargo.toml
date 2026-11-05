@@ -17,6 +17,8 @@ categories = ["cryptography::cryptocurrencies", "network-programming"]
 [dependencies]
 bip324 = { version = "0.10", features = [ "tokio" ] }
 bitcoin = { workspace = true }
+bitcoin_hashes = { version = "0.18.0", default-features = false }
+data-encoding = "2.10.0"
 dns-lookup = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
