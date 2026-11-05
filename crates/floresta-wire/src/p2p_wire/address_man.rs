@@ -1230,6 +1230,23 @@ mod test {
     use crate::address_man::ReachableNetworks;
     use crate::address_man::SUPPORTED_NETWORKS;
 
+    #[test]
+    fn mainnet_and_signet_fixed_seeds_are_separate() {
+        let peers = |network| {
+            let disk: Vec<DiskLocalAddress> =
+                serde_json::from_str(AddressMan::get_net_seeds(network)).unwrap();
+            disk.into_iter().map(LocalAddress::from).collect::<Vec<_>>()
+        };
+        let signet = peers(Network::Signet);
+        let mainnet = peers(Network::Bitcoin);
+        assert!(!mainnet.is_empty());
+        for peer in mainnet {
+            assert!(!signet.iter().any(|other| {
+                peer.get_addrv2() == other.get_addrv2() && peer.get_port() == other.get_port()
+            }));
+        }
+    }
+
     fn load_addresses_from_json(file_path: &str) -> io::Result<Vec<LocalAddress>> {
         let mut contents = String::new();
         File::open(file_path)?.read_to_string(&mut contents)?;

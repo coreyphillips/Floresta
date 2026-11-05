@@ -391,6 +391,7 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
     #[rustfmt::skip]
     match network {
         Network::Bitcoin => {
+            seeds.push(DnsSeed::new(Network::Bitcoin, "bitcoin.seed.dlsouza.lol", service_flags::UTREEXO.into()));
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.calvinkim.info", x1009));
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.luisschwab.com", x1009));
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.sipa.be", x9));
