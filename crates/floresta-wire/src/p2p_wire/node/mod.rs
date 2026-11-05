@@ -228,6 +228,10 @@ pub struct LocalPeerView {
 }
 
 impl LocalPeerView {
+    pub(crate) fn serves_block_bodies(&self) -> bool {
+        self.services.has(ServiceFlags::NETWORK) || self.services.has(ServiceFlags::NETWORK_LIMITED)
+    }
+
     /// Whether this is a manually added peer
     pub(crate) const fn is_manual_peer(&self) -> bool {
         matches!(self.kind, ConnectionKind::Manual)

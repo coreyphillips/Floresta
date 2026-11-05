@@ -446,3 +446,82 @@ mod tests {
         }
     }
 }
+
+#[tokio::test]
+async fn block_and_proof_requests_use_different_peers() {
+    use crate::node_interface::UserRequest;
+    use tokio::sync::oneshot;
+
+    let dir = format!("./tmp-db/{}.proof_routes", rand::random::<u32>());
+    let store = FlatChainStore::new(FlatChainStoreConfig::new(dir.clone())).unwrap();
+    let chain = Arc::new(ChainState::new(
+        store,
+        Network::Regtest,
+        AssumeValidArg::Disabled,
+    ));
+    let mut node = UtreexoNode::<_, SyncNode>::new(
+        get_node_config(dir.clone(), Network::Regtest, false),
+        chain,
+        Arc::new(Mutex::new(Mempool::new(1000))),
+        None,
+        Arc::new(RwLock::new(false)),
+        AddressMan::new(None, &[]),
+    )
+    .unwrap();
+    let (block_tx, mut blocks) = unbounded_channel();
+    let (proof_tx, mut proofs) = unbounded_channel();
+    for (id, services, channel) in [
+        (1, ServiceFlags::NETWORK | ServiceFlags::WITNESS, block_tx),
+        (
+            2,
+            ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into(),
+            proof_tx,
+        ),
+    ] {
+        let mut latency = Ema::with_half_life_50();
+        latency.add(0.01);
+        node.peers.insert(
+            id,
+            LocalPeerView {
+                address: "127.0.0.1".parse().unwrap(),
+                port: 8333,
+                services,
+                channel,
+                user_agent: "fixture".into(),
+                height: 100,
+                state: PeerStatus::Ready,
+                kind: ConnectionKind::Regular(services),
+                banscore: 0,
+                address_id: id,
+                _last_message: Instant::now(),
+                transport_protocol: TransportProtocol::V2,
+                message_times: latency,
+            },
+        );
+    }
+    let hash = signet_headers()[1].block_hash();
+    node.request_blocks(vec![hash]).unwrap();
+    assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]));
+    assert!(proofs.try_recv().is_err());
+
+    // A single available peer of the wrong class must not receive an arbitrary
+    // historical block or proof request, even when it has the lowest latency.
+    let full = node.peers.remove(&1).unwrap();
+    node.perform_user_request(UserRequest::Block(hash), oneshot::channel().0)
+        .await;
+    assert!(proofs.try_recv().is_err());
+    node.perform_user_request(UserRequest::UtreexoProof(hash), oneshot::channel().0)
+        .await;
+    assert!(matches!(proofs.try_recv(), Ok(NodeRequest::GetBlockProof((h, _, _))) if h == hash));
+    node.peers.insert(1, full);
+    node.peers.remove(&2);
+    node.perform_user_request(UserRequest::UtreexoProof(hash), oneshot::channel().0)
+        .await;
+    assert!(blocks.try_recv().is_err());
+    node.perform_user_request(UserRequest::Block(hash), oneshot::channel().0)
+        .await;
+    assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]));
+
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+}

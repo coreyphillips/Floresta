@@ -388,14 +388,18 @@ impl AddressMan {
             .as_secs()
     }
 
+    // Bridges can serve BIP183 inclusion proofs without serving block bodies.
+    fn useful_services(flags: ServiceFlags) -> bool {
+        flags.has(ServiceFlags::WITNESS)
+            && (flags.has(ServiceFlags::NETWORK_LIMITED) || flags.has(service_flags::UTREEXO.into()))
+    }
+
     /// Add a new address to our list of known address
     pub fn push_addresses(&mut self, addresses: &[LocalAddress]) {
         for address in addresses {
             let id = address.id;
             // don't add addresses that don't have the minimum required services
-            if !address.services.has(ServiceFlags::WITNESS)
-                || !address.services.has(ServiceFlags::NETWORK_LIMITED)
-            {
+            if !Self::useful_services(address.services) {
                 continue;
             }
 
@@ -423,6 +427,7 @@ impl AddressMan {
                     self.good_addresses.push(id);
                 }
 
+                self.push_if_has_service(address, ServiceFlags::NETWORK);
                 self.push_if_has_service(address, service_flags::UTREEXO.into());
                 self.push_if_has_service(address, ServiceFlags::NONE); // this means any peer
                 self.push_if_has_service(address, ServiceFlags::COMPACT_FILTERS);
@@ -882,6 +887,7 @@ impl AddressMan {
                 }
 
                 if let Some(address) = self.addresses.get(&idx).cloned() {
+                    self.push_if_has_service(&address, ServiceFlags::NETWORK);
                     self.push_if_has_service(&address, service_flags::UTREEXO.into());
                     self.push_if_has_service(&address, service_flags::UTREEXO_ARCHIVE.into());
                     self.push_if_has_service(&address, ServiceFlags::NONE); // this means any peer
@@ -902,6 +908,7 @@ impl AddressMan {
 
                 // push to the good peers by service
                 if let Some(address) = self.addresses.get(&idx).cloned() {
+                    self.push_if_has_service(&address, ServiceFlags::NETWORK);
                     self.push_if_has_service(&address, service_flags::UTREEXO.into());
                     self.push_if_has_service(&address, ServiceFlags::NONE); // this means any peer
                     self.push_if_has_service(&address, ServiceFlags::COMPACT_FILTERS);
@@ -918,40 +925,18 @@ impl AddressMan {
         self
     }
 
-    /// Adds a peer to the list of peers known to have some service
-    fn add_peer_to_service(&mut self, idx: usize, service: ServiceFlags) {
-        if let Some(peers) = self.peers_by_service.get_mut(&service) {
-            if peers.contains(&idx) {
-                return;
-            }
-
-            peers.push(idx);
-        } else {
-            self.peers_by_service.insert(service, vec![idx]);
-        }
-    }
-
-    /// Removes a peer from the list of peers known to have some service
-    fn remove_peer_from_service(&mut self, idx: usize, service: ServiceFlags) {
-        if let Some(peers) = self.peers_by_service.get_mut(&service) {
-            peers.retain(|&x| x != idx);
-        }
-    }
-
-    /// Updates the list of peers that have a service
-    ///
-    /// If a peer used to advertise a service, but now it doesn't, we remove it from the list
-    /// of peers that have that service. If a peer didn't advertise a service, but now it does,
-    /// we add it to the list of peers that have that service.
+    /// Reconcile both candidate lists after a verified version message.
     fn update_peer_for_service(&mut self, id: usize, service: ServiceFlags) {
-        let Some(peer) = self.addresses.get(&id) else {
+        let Some(peer) = self.addresses.get(&id).cloned() else {
             return;
         };
-
-        match peer.services.has(service) {
-            true => self.add_peer_to_service(id, service),
-            false => self.remove_peer_from_service(id, service),
+        if let Some(peers) = self.peers_by_service.get_mut(&service) {
+            peers.retain(|&p| p != id);
         }
+        if let Some(peers) = self.good_peers_by_service.get_mut(&service) {
+            peers.retain(|&p| p != id);
+        }
+        self.push_if_has_service(&peer, service);
     }
 
     /// Updates `peers_by_service` buckets with the latest service flags info about a peer
@@ -959,19 +944,18 @@ impl AddressMan {
     /// This function is called when we receive a version message from a peer, telling which
     /// services it advertises.
     ///
-    /// We only index for Compact Filters and Utreexo. For NODE_NETWORK and NODE_WITNESS we already
-    /// filter them out when we add them to the address manager, therefore, all peers in this list
-    /// is already known for having those. And we don't care about the rest of the services,
-    /// like NODE_BLOOM.
+    /// Block and proof services are independent capabilities.
     fn update_peer_services_buckets(&mut self, idx: usize) {
+        self.update_peer_for_service(idx, ServiceFlags::NETWORK);
         self.update_peer_for_service(idx, service_flags::UTREEXO.into());
+        self.update_peer_for_service(idx, service_flags::UTREEXO_ARCHIVE.into());
         self.update_peer_for_service(idx, ServiceFlags::COMPACT_FILTERS);
     }
 
     /// Updates the service flags after we receive a version message
     pub fn update_set_service_flag(&mut self, idx: usize, flags: ServiceFlags) -> &mut Self {
         // if this peer turns out to not have the minimum required services, we remove it
-        if !flags.has(ServiceFlags::NETWORK_LIMITED) || !flags.has(ServiceFlags::WITNESS) {
+        if !Self::useful_services(flags) {
             self.addresses.remove(&idx);
             for peers in self.peers_by_service.values_mut() {
                 peers.retain(|&x| x != idx);
@@ -1559,6 +1543,59 @@ mod test {
             port: 8333,
             id: 0,
         }));
+    }
+
+    #[test]
+    fn proof_only_candidates_survive_gossip_disk_and_service_updates() {
+        let mut addresses = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        let proof = ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into();
+        let raw = ServiceFlags::WITNESS | ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED;
+        let mut bridge = LocalAddress::from(AddrV2::Ipv4("42.43.44.45".parse().unwrap()));
+        bridge.services = proof;
+        bridge.state = AddressState::Tried(AddressMan::time_since_unix());
+        addresses.push_addresses(&[bridge.clone()]);
+        assert_eq!(
+            addresses
+                .get_address_by_service(service_flags::UTREEXO.into())
+                .unwrap()
+                .0,
+            bridge.id
+        );
+        assert!(addresses
+            .get_address_by_service(ServiceFlags::NETWORK)
+            .is_none());
+
+        let restored = LocalAddress::from(DiskLocalAddress::from(bridge.clone()));
+        let mut from_disk = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        from_disk.push_addresses(&[restored]);
+        assert!(from_disk
+            .get_address_by_service(service_flags::UTREEXO.into())
+            .is_some());
+
+        addresses.update_set_service_flag(bridge.id, raw);
+        assert!(addresses
+            .get_address_by_service(service_flags::UTREEXO.into())
+            .is_none());
+        assert_eq!(
+            addresses
+                .get_address_by_service(ServiceFlags::NETWORK)
+                .unwrap()
+                .0,
+            bridge.id
+        );
+        addresses.update_set_service_flag(bridge.id, proof);
+        assert!(addresses
+            .get_address_by_service(ServiceFlags::NETWORK)
+            .is_none());
+        assert_eq!(
+            addresses
+                .get_address_by_service(service_flags::UTREEXO.into())
+                .unwrap()
+                .0,
+            bridge.id
+        );
+        addresses.update_set_service_flag(bridge.id, service_flags::UTREEXO.into());
+        assert!(!addresses.addresses.contains_key(&bridge.id));
     }
 
     #[test]

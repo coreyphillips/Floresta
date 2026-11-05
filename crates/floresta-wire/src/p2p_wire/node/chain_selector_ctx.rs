@@ -59,7 +59,7 @@ use floresta_chain::proof_util;
 use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
 use floresta_common::service_flags;
-use rand::seq::SliceRandom;
+use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
@@ -665,7 +665,10 @@ where
             .get(&service_flags::UTREEXO.into())
             .ok_or(WireError::NoPeersAvailable)?;
 
+        // Fraud challenges need the same peer to supply the block and its proof.
         let rand_peer = *peers
+            .iter()
+            .filter(|id| self.peers.get(id).is_some_and(|peer| peer.serves_block_bodies()))
             .choose(&mut thread_rng())
             .ok_or(WireError::NoPeersAvailable)?;
 
@@ -898,7 +901,7 @@ where
     ) -> Result<FindAccResult, WireError> {
         for peer_id in self.common.peer_ids.iter() {
             let peer = self.peers.get(peer_id).unwrap();
-            if peer.services.has(service_flags::UTREEXO_ARCHIVE.into()) {
+            if peer.services.has(service_flags::UTREEXO_ARCHIVE.into()) && peer.serves_block_bodies() {
                 self.send_to_peer(*peer_id, NodeRequest::GetUtreexoState((block, height)))?;
                 self.common.inflight.insert(
                     InflightRequests::UtreexoState(*peer_id),

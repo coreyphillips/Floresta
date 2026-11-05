@@ -959,15 +959,15 @@ where
 
                             self.chain.accept_header(*header)?;
 
-                            self.send_to_peer(
-                                peer,
-                                NodeRequest::GetBlock(vec![header.block_hash()]),
-                            )?;
-
-                            self.inflight.insert(
-                                InflightRequests::Blocks(header.block_hash()),
-                                (peer, Instant::now()),
-                            );
+                            // A proof bridge can announce headers but cannot supply their blocks.
+                            if self.peers.get(&peer).is_some_and(|p| p.serves_block_bodies()) {
+                                self.send_to_peer(peer, NodeRequest::GetBlock(vec![block_hash]))?;
+                                self.inflight.insert(
+                                    InflightRequests::Blocks(block_hash), (peer, Instant::now()),
+                                );
+                            } else {
+                                self.request_blocks(vec![block_hash])?;
+                            }
                         }
                    }
 
