@@ -4,6 +4,7 @@
 //! No Electrum client can register a watch or read this index.
 
 mod confirmed;
+mod pending;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, BufRead, Read, Write};
@@ -53,6 +54,8 @@ struct Command {
     offset: Option<u32>,
     #[serde(default)]
     query: Option<confirmed::Query>,
+    #[serde(default)]
+    pending: Option<pending::Query>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -114,6 +117,7 @@ struct Owner {
 }
 
 struct Registry {
+    pool: Arc<Mutex<pending::Pool>>,
     db: sled::Db,
     owners: BTreeMap<String, Owner>,
 }
@@ -179,7 +183,7 @@ impl Registry {
             }
             owners.insert(id.to_string(), owner);
         }
-        Ok(Self { db, owners })
+        Ok(Self { db, owners, pool: Default::default() })
     }
 
     fn command(
@@ -190,6 +194,18 @@ impl Registry {
     ) -> Result<Value> {
         if !owner_id(&request.owner) {
             return Err("Invalid watch owner.");
+        }
+        if let Some(query) = request.pending {
+            if request.action != "pending" || request.query.is_some() || request.txid.is_some()
+                || request.offset.is_some() || !request.scripts.is_empty() || !request.outpoints.is_empty()
+                || !request.descriptors.is_empty() {
+                return Err("Invalid pending query.");
+            }
+            let Some(owner) = self.owners.get_mut(&request.owner) else {
+                return Ok(json!({"phase":"unavailable"}));
+            };
+            owner.reconcile(chain)?;
+            return self.pool.lock().map_err(storage)?.page(owner, chain, query);
         }
         if let Some(query) = request.query {
             if request.action != "confirmed"
@@ -664,6 +680,8 @@ pub(crate) fn start<C: BlockchainInterface + Send + Sync + 'static>(
         Registry::open(&Path::new(data_dir).join("chicory-watches-v1"))
             .map_err(io::Error::other)?,
     ));
+    let pending_pool = registry.lock().map_err(|_| io::Error::other("Pending view unavailable."))?.pool.clone();
+    pending::start(pending_pool, peer.clone(), network, chain.clone(), stop.clone())?;
     let control = registry.clone();
     let reader_chain = chain.clone();
     let owner_lifetime = stop.clone();

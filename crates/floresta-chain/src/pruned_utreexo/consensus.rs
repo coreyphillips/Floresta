@@ -515,7 +515,8 @@ impl Consensus {
         Ok(acc)
     }
 
-    fn contains_unspendable_utxo(del_hashes: &[sha256::Hash]) -> bool {
+    /// Check the overwritten historical coinbases excluded from block and transaction inputs.
+    pub fn contains_unspendable_utxo(del_hashes: &[sha256::Hash]) -> bool {
         del_hashes.iter().any(|hash| {
             let bytes = hash.as_ref();
             bytes == UNSPENDABLE_BIP30_UTXO_91722 || bytes == UNSPENDABLE_BIP30_UTXO_91812
