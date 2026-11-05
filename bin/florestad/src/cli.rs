@@ -48,6 +48,10 @@ pub struct Cli {
     /// Defaults to `~/.floresta`. The passed value should be an absolute path.
     pub data_dir: Option<String>,
 
+    /// Remove only the checked Chicory database files for this profile fingerprint.
+    #[arg(long, requires = "data_dir", conflicts_with = "managed_stdio")]
+    pub managed_cleanup_for: Option<String>,
+
     #[arg(long)]
     /// Whether Compact Block Filters should be disabled
     ///
