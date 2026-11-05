@@ -19,7 +19,7 @@
 mod cli;
 #[cfg(unix)]
 mod daemonize;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod managed_cleanup;
 
 use std::env;
@@ -58,7 +58,7 @@ fn main() {
     // If not provided defaults to `$HOME/.floresta`. Uses a subdirectory for non-mainnet networks.
     let data_dir = data_dir_path(params.data_dir.clone(), params.network);
     if let Some(owner) = params.managed_cleanup_for {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if managed_cleanup::remove(
             params.data_dir.as_deref().unwrap(),
             &data_dir,
@@ -70,7 +70,7 @@ fn main() {
             println!("chicory.storage-removed/1");
             return;
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let _ = owner;
         eprintln!("Managed storage cleanup could not safely finish.");
         exit(1);
