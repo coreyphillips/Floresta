@@ -447,11 +447,10 @@ mod tests {
     }
 }
 
-#[tokio::test]
-async fn block_and_proof_requests_use_different_peers() {
-    use crate::node_interface::UserRequest;
-    use tokio::sync::oneshot;
-
+fn routing_node() -> (
+    String,
+    UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+) {
     let dir = format!("./tmp-db/{}.proof_routes", rand::random::<u32>());
     let store = FlatChainStore::new(FlatChainStoreConfig::new(dir.clone())).unwrap();
     let chain = Arc::new(ChainState::new(
@@ -459,7 +458,7 @@ async fn block_and_proof_requests_use_different_peers() {
         Network::Regtest,
         AssumeValidArg::Disabled,
     ));
-    let mut node = UtreexoNode::<_, SyncNode>::new(
+    let node = UtreexoNode::<_, SyncNode>::new(
         get_node_config(dir.clone(), Network::Regtest, false),
         chain,
         Arc::new(Mutex::new(Mempool::new(1000))),
@@ -468,37 +467,50 @@ async fn block_and_proof_requests_use_different_peers() {
         AddressMan::new(None, &[]),
     )
     .unwrap();
-    let (block_tx, mut blocks) = unbounded_channel();
-    let (proof_tx, mut proofs) = unbounded_channel();
-    for (id, services, channel) in [
-        (1, ServiceFlags::NETWORK | ServiceFlags::WITNESS, block_tx),
-        (
-            2,
-            ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into(),
-            proof_tx,
-        ),
-    ] {
-        let mut latency = Ema::with_half_life_50();
-        latency.add(0.01);
-        node.peers.insert(
-            id,
-            LocalPeerView {
-                address: "127.0.0.1".parse().unwrap(),
-                port: 8333,
-                services,
-                channel,
-                user_agent: "fixture".into(),
-                height: 100,
-                state: PeerStatus::Ready,
-                kind: ConnectionKind::Regular(services),
-                banscore: 0,
-                address_id: id,
-                _last_message: Instant::now(),
-                transport_protocol: TransportProtocol::V2,
-                message_times: latency,
-            },
-        );
-    }
+    (dir, node)
+}
+
+fn routing_peer(
+    node: &mut UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+    id: u32,
+    services: ServiceFlags,
+) -> UnboundedReceiver<NodeRequest> {
+    let (channel, receiver) = unbounded_channel();
+    let mut latency = Ema::with_half_life_50();
+    latency.add(0.01);
+    node.peers.insert(
+        id,
+        LocalPeerView {
+            address: "127.0.0.1".parse().unwrap(),
+            port: 8333,
+            services,
+            channel,
+            user_agent: "fixture".into(),
+            height: 100,
+            state: PeerStatus::Ready,
+            kind: ConnectionKind::Regular(services),
+            banscore: 0,
+            address_id: id,
+            _last_message: Instant::now(),
+            transport_protocol: TransportProtocol::V2,
+            message_times: latency,
+        },
+    );
+    receiver
+}
+
+#[tokio::test]
+async fn block_and_proof_requests_use_different_peers() {
+    use crate::node_interface::UserRequest;
+    use tokio::sync::oneshot;
+
+    let (dir, mut node) = routing_node();
+    let mut blocks = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let mut proofs = routing_peer(
+        &mut node,
+        2,
+        ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into(),
+    );
     let hash = signet_headers()[1].block_hash();
     node.request_blocks(vec![hash]).unwrap();
     assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]));
@@ -522,6 +534,76 @@ async fn block_and_proof_requests_use_different_peers() {
         .await;
     assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]));
 
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn archival_routes_cover_history_live_boundary_and_retries() {
+    use crate::node_interface::UserRequest;
+    use tokio::sync::oneshot;
+    let (dir, mut node) = routing_node();
+    let mut blocks = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let mut recent = routing_peer(&mut node, 2, service_flags::UTREEXO.into());
+    let mut archive = routing_peer(&mut node, 3, service_flags::UTREEXO_ARCHIVE.into());
+
+    // Mine local regtest headers and test both sides of the BIP183 288-block boundary.
+    let mut header = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+    let mut hashes = vec![header.block_hash()];
+    for _ in 1..=289 {
+        header.prev_blockhash = header.block_hash();
+        header.time += 600;
+        header.nonce = 0;
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        hashes.push(header.block_hash());
+        node.chain.accept_header(header).unwrap();
+    }
+    for (hash, receiver) in [(hashes[1], &mut archive), (hashes[2], &mut recent)] {
+        node.perform_user_request(UserRequest::UtreexoProof(hash), oneshot::channel().0)
+            .await;
+        assert!(
+            matches!(receiver.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash)
+        );
+    }
+    assert!(blocks.try_recv().is_err());
+
+    // The initial block request, a missed proof and a timed-out proof must
+    // all use the same routing rules. This block has non-coinbase spends.
+    let bytes = zstd::decode_all(
+        &include_bytes!("../../../../floresta-chain/testdata/block_367891/raw.zst")[..],
+    )
+    .unwrap();
+    let block: Block = encode::deserialize(&bytes).unwrap();
+    let hash = block.block_hash();
+    node.request_block_proof(block, 1).unwrap();
+    assert!(matches!(archive.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash));
+    let req = InflightRequests::UtreexoProof(hash);
+    node.inflight.remove(&req);
+    node.redo_inflight_request(&req, 3).unwrap();
+    assert!(matches!(recent.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash));
+    node.inflight.remove(&req);
+    node.peers.remove(&2);
+    node.ask_for_missed_proofs().unwrap();
+    assert!(matches!(archive.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash));
+    node.request_blocks(vec![hashes[2]]).unwrap();
+    assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(ids)) if ids == [hashes[2]]));
+    assert!(archive.try_recv().is_err());
+
+    // A full NODE_NETWORK + NODE_UTREEXO peer also promises all historical proofs.
+    node.peers.remove(&3);
+    let mut full = routing_peer(
+        &mut node,
+        4,
+        ServiceFlags::NETWORK | service_flags::UTREEXO.into(),
+    );
+    let _opportunistic = routing_peer(&mut node, 5, service_flags::UTREEXO.into());
+    node.perform_user_request(UserRequest::UtreexoProof(hashes[1]), oneshot::channel().0)
+        .await;
+    assert!(
+        matches!(full.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hashes[1])
+    );
     drop(node);
     std::fs::remove_dir_all(dir).unwrap();
 }

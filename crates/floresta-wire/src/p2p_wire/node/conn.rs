@@ -589,7 +589,16 @@ where
 
         for address in anchors {
             self.open_connection(
-                ConnectionKind::Regular(service_flags::UTREEXO.into()),
+                ConnectionKind::Regular(
+                    if address
+                        .get_services()
+                        .has(service_flags::UTREEXO_ARCHIVE.into())
+                    {
+                        service_flags::UTREEXO_ARCHIVE.into()
+                    } else {
+                        service_flags::UTREEXO.into()
+                    },
+                ),
                 address.id,
                 address,
                 // Using V1 transport fallback as utreexo nodes have limited support

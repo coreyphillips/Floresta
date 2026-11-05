@@ -175,12 +175,13 @@ where
             }
         };
 
-        let required = match &user_req {
-            UserRequest::Block(_) => ServiceFlags::NETWORK,
-            UserRequest::UtreexoProof(_) => floresta_common::service_flags::UTREEXO.into(),
-            _ => ServiceFlags::NONE,
+        let peer = match &user_req {
+            UserRequest::Block(_) => {
+                self.send_to_fast_peer(req, ServiceFlags::NETWORK | ServiceFlags::WITNESS)
+            }
+            UserRequest::UtreexoProof(hash) => self.send_block_proof_request(*hash, req, None),
+            _ => self.send_to_fast_peer(req, ServiceFlags::NONE),
         };
-        let peer = self.send_to_fast_peer(req, required);
         if let Ok(peer) = peer {
             self.inflight_user_requests
                 .insert(user_req, (peer, Instant::now(), responder));

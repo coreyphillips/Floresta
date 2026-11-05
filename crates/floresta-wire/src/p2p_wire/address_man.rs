@@ -390,8 +390,10 @@ impl AddressMan {
 
     // Bridges can serve BIP183 inclusion proofs without serving block bodies.
     fn useful_services(flags: ServiceFlags) -> bool {
-        flags.has(ServiceFlags::WITNESS)
-            && (flags.has(ServiceFlags::NETWORK_LIMITED) || flags.has(service_flags::UTREEXO.into()))
+        flags.has(service_flags::UTREEXO_ARCHIVE.into())
+            || (flags.has(ServiceFlags::WITNESS)
+                && (flags.has(ServiceFlags::NETWORK_LIMITED)
+                    || flags.has(service_flags::UTREEXO.into())))
     }
 
     /// Add a new address to our list of known address
@@ -429,6 +431,7 @@ impl AddressMan {
 
                 self.push_if_has_service(address, ServiceFlags::NETWORK);
                 self.push_if_has_service(address, service_flags::UTREEXO.into());
+                self.push_if_has_service(address, service_flags::UTREEXO_ARCHIVE.into());
                 self.push_if_has_service(address, ServiceFlags::NONE); // this means any peer
                 self.push_if_has_service(address, ServiceFlags::COMPACT_FILTERS);
             }
@@ -654,9 +657,8 @@ impl AddressMan {
     /// Returns a new random address to open a new connection, we try to get addresses with
     /// a set of features supported for our peers
     ///
-    /// If no peers are known with the required service bit, we may return a random peer.
-    /// Service bits are learned from DNS seeds or peer gossip and may be outdated or
-    /// inaccurate, so we sometimes try random peers expecting they might implement the service.
+    /// Exact block and proof roles only use addresses advertising that service.
+    /// Non-specialized searches can probe other addresses whose advertised services are stale.
     pub fn get_address_to_connect(
         &mut self,
         required_service: ServiceFlags,
@@ -818,9 +820,7 @@ impl AddressMan {
 
     /// Attempt to find one random peer that advertises the required service
     ///
-    /// If we cannot find a peer that advertises the required service, we return any peer
-    /// that we have in our list of known peers. Luckily, either we'll connect to a peer that has
-    /// this but we didn't know, or one of those peers will give us useful addresses.
+    /// Skip recently failed and currently connected candidates.
     fn try_with_service(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
         if let Some(peers) = self.peers_by_service.get(&service) {
             let peers = peers
@@ -864,7 +864,16 @@ impl AddressMan {
             return Some(address);
         }
 
-        // if we can't find a peer that advertises the required service, get any peer
+        // A proof search must not consume every known block endpoint, or vice versa.
+        // Ordinary discovery and feelers still try addresses with other capabilities.
+        if service == ServiceFlags::NETWORK
+            || service == service_flags::UTREEXO.into()
+            || service == service_flags::UTREEXO_ARCHIVE.into()
+        {
+            return None;
+        }
+
+        // For other roles, try an address whose advertised services may be stale.
         let idx = rand::random::<usize>() % self.addresses.len();
         let peer = self.addresses.keys().nth(idx)?;
 
@@ -910,6 +919,7 @@ impl AddressMan {
                 if let Some(address) = self.addresses.get(&idx).cloned() {
                     self.push_if_has_service(&address, ServiceFlags::NETWORK);
                     self.push_if_has_service(&address, service_flags::UTREEXO.into());
+                    self.push_if_has_service(&address, service_flags::UTREEXO_ARCHIVE.into());
                     self.push_if_has_service(&address, ServiceFlags::NONE); // this means any peer
                     self.push_if_has_service(&address, ServiceFlags::COMPACT_FILTERS);
                 }
@@ -1596,6 +1606,43 @@ mod test {
         );
         addresses.update_set_service_flag(bridge.id, service_flags::UTREEXO.into());
         assert!(!addresses.addresses.contains_key(&bridge.id));
+    }
+
+    #[test]
+    fn archive_only_services_do_not_require_a_witness_or_a_block_body() {
+        let archive: ServiceFlags = service_flags::UTREEXO_ARCHIVE.into();
+        let mut addr = LocalAddress::from(AddrV2::Ipv4("42.43.44.47".parse().unwrap()));
+        addr.services = archive;
+        addr.state = AddressState::Tried(AddressMan::time_since_unix());
+        let mut manager = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        manager.push_addresses(&[LocalAddress::from(DiskLocalAddress::from(addr.clone()))]);
+        assert_eq!(manager.get_address_by_service(archive).unwrap().0, addr.id);
+        assert!(manager
+            .get_address_by_service(ServiceFlags::NETWORK)
+            .is_none());
+        assert!(manager
+            .get_address_by_service(service_flags::UTREEXO.into())
+            .is_none());
+        assert!(manager
+            .get_address_to_connect(ServiceFlags::NETWORK, false)
+            .is_none());
+        manager.update_set_service_flag(
+            addr.id,
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::NETWORK_LIMITED,
+        );
+        assert!(manager
+            .get_address_to_connect(service_flags::UTREEXO.into(), false)
+            .is_none());
+        assert!(manager.get_address_to_connect(archive, false).is_none());
+        assert_eq!(
+            manager
+                .get_address_to_connect(ServiceFlags::NETWORK, false)
+                .unwrap()
+                .0,
+            addr.id
+        );
+        manager.update_set_service_flag(addr.id, ServiceFlags::NONE);
+        assert!(manager.get_address_by_service(archive).is_none());
     }
 
     #[test]

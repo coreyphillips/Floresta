@@ -146,17 +146,34 @@ where
         // retry the added peers connections
         self.maybe_open_connection_with_added_peers()?;
 
-        // if we have 10 connections, but not a single utreexo or CBF one, disconnect one random
-        // peer and create a utreexo and CBS connection
-        if !self.has_utreexo_peers() {
-            if self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
+        // Historical wallet scans can still need proofs far behind the active tip.
+        let need_archive = !self.has_historical_proof_peer();
+        let need_recent = !self.has_utreexo_peers();
+        if (need_archive || need_recent)
+            && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS
+        {
+            let count = |test: fn(&super::LocalPeerView) -> bool| {
                 self.peers
                     .values()
-                    .filter(|peer| peer.is_regular_peer())
-                    .choose(&mut thread_rng())
-                    .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
-            }
-
+                    .filter(|p| p.state == super::PeerStatus::Ready && test(p))
+                    .count()
+            };
+            let body_peers = count(super::LocalPeerView::serves_block_bodies);
+            let proof_peers = count(super::LocalPeerView::serves_block_proofs);
+            self.peers
+                .values()
+                .filter(|p| {
+                    p.is_regular_peer()
+                        && (!p.serves_block_proofs() || (need_archive && proof_peers > 1))
+                        && (!p.serves_block_bodies() || body_peers > 1)
+                })
+                .choose(&mut thread_rng())
+                .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
+        }
+        if need_archive {
+            self.maybe_open_connection(service_flags::UTREEXO_ARCHIVE.into())?;
+        }
+        if need_recent {
             self.maybe_open_connection(service_flags::UTREEXO.into())?;
         }
 
@@ -254,6 +271,7 @@ where
             self.kill_signal.clone(),
             self.address_man.clone(),
         )?;
+        node.historical_replay = true;
         node.context.replay = Some((checkpoint.clone(), status.clone(), height));
         let outer = self.chain.clone();
         let progress = status.clone();
@@ -365,7 +383,7 @@ where
             }
         };
 
-        let backfill = UtreexoNode::<PartialChainState, SyncNode>::new(
+        let mut backfill = UtreexoNode::<PartialChainState, SyncNode>::new(
             self.config.clone(),
             chain,
             self.mempool.clone(),
@@ -378,6 +396,7 @@ where
         let datadir = self.config.datadir.clone();
         let outer_chain = self.chain.clone();
 
+        backfill.historical_replay = true;
         let fut = UtreexoNode::<PartialChainState, SyncNode>::run(
             backfill,
             move |chain: &PartialChainState| {
@@ -670,7 +689,7 @@ where
         try_and_log!(self.ask_missed_block());
 
         // requests that need a utreexo peer
-        if !self.has_utreexo_peers() {
+        if !self.has_block_proof_peers() {
             return LoopControl::Continue;
         }
 

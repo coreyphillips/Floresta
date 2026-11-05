@@ -67,7 +67,10 @@ where
     /// Each candidate weight is computed as `lowest_time / time_i`. For instance, if we have two
     /// candidates with latencies of 50ms and 100ms, weights are 1.0 and 0.5 respectively, and the
     /// probability of being chosen is 2/3 and 1/3.
-    fn choose_peer_by_latency(&self, service: ServiceFlags) -> Option<(&PeerId, &LocalPeerView)> {
+    fn choose_peer_by_latency(
+        &self,
+        accepts: impl Fn(PeerId, &LocalPeerView) -> bool,
+    ) -> Option<(&PeerId, &LocalPeerView)> {
         // Epsilon is a small positive floor for `f64`. If by any chance a peer has extremely low
         // message latency, we clamp it to `EPS` so `lowest_time / time_i` stays finite and stable.
         const EPS: f64 = 1e-9;
@@ -75,7 +78,7 @@ where
         let candidates: Vec<(&PeerId, &LocalPeerView, f64)> = self
             .peers
             .iter()
-            .filter(|(_, peer)| peer.services.has(service) && peer.state == PeerStatus::Ready)
+            .filter(|(id, peer)| peer.state == PeerStatus::Ready && accepts(**id, peer))
             .filter_map(|(id, peer)| {
                 // Get the average message latency from each peer
                 let Some(t) = peer.message_times.value() else {
@@ -122,12 +125,58 @@ where
         required_service: ServiceFlags,
     ) -> Result<PeerId, WireError> {
         let (peer_id, peer) = self
-            .choose_peer_by_latency(required_service)
+            .choose_peer_by_latency(|_, peer| peer.services.has(required_service))
             .ok_or(WireError::NoPeersAvailable)?;
 
         peer.channel.send(request)?;
 
         Ok(*peer_id)
+    }
+
+    /// BIP183 archives and full Utreexo nodes promise historical proofs. Recent
+    /// providers may retain older proofs, so keep them as a fallback. Never
+    /// send a block-body request to a proof-only peer or use it for tx relay.
+    pub(crate) fn send_block_proof_request(
+        &self,
+        hash: bitcoin::BlockHash,
+        request: NodeRequest,
+        previous: Option<PeerId>,
+    ) -> Result<PeerId, WireError> {
+        let historical = if self.historical_replay {
+            true
+        } else {
+            let (tip, _) = self.chain.get_best_block()?;
+            // Unknown hashes are allowed in the existing by-hash API. Height
+            // only chooses a provider; proofs are still checked against the stump.
+            self.chain
+                .get_block_height(&hash)
+                .ok()
+                .flatten()
+                .is_none_or(|height| tip.saturating_sub(height) >= 288)
+        };
+        // Try another capable peer on timeout, even if its advertised range is
+        // less specific. A single provider can be retried after its timeout.
+        for exclude in [previous, None] {
+            let ready = |id, p: &LocalPeerView| Some(id) != exclude && p.serves_block_proofs();
+            let peer = self
+                .choose_peer_by_latency(|id, p| {
+                    ready(id, p)
+                        && if historical {
+                            p.serves_historical_proofs()
+                        } else {
+                            p.services.has(service_flags::UTREEXO.into())
+                        }
+                })
+                .or_else(|| self.choose_peer_by_latency(ready));
+            if let Some((id, peer)) = peer {
+                peer.channel.send(request)?;
+                return Ok(*id);
+            }
+            if exclude.is_none() {
+                break;
+            }
+        }
+        Err(WireError::NoPeersAvailable)
     }
 
     #[inline]
@@ -230,7 +279,7 @@ where
         let good_peers_count = self.connected_peers();
         if good_peers_count > T::MAX_OUTGOING_PEERS {
             // We allow utreexo, extra and manual peers to bypass our connection limits
-            let is_utreexo_peer = matches!(version.kind, ConnectionKind::Regular(services) if services.has(service_flags::UTREEXO.into()));
+            let is_utreexo_peer = matches!(version.kind, ConnectionKind::Regular(services) if services.has(service_flags::UTREEXO.into()) || services.has(service_flags::UTREEXO_ARCHIVE.into()));
             let is_manual_peer = version.kind == ConnectionKind::Manual;
             let is_extra = version.kind == ConnectionKind::Extra;
 
@@ -484,7 +533,7 @@ where
         for req in inflight {
             self.inflight.remove(&req.0);
 
-            if let Err(e) = self.redo_inflight_request(&req.0) {
+            if let Err(e) = self.redo_inflight_request(&req.0, peer) {
                 // CRITICAL: never drop the request, so we retry it later
                 self.inflight.insert(req.0, req.1);
                 return Err(e);
@@ -599,7 +648,7 @@ where
             // Increase the banscore and try banning the peer if needed, then re-request
             try_and_log!(self.increase_banscore(peer, 1));
 
-            if let Err(e) = self.redo_inflight_request(&req) {
+            if let Err(e) = self.redo_inflight_request(&req, peer) {
                 // CRITICAL: never drop the request, so we retry it later
                 self.inflight.insert(req, (peer, time));
                 return Err(e);
@@ -635,10 +684,11 @@ where
     pub(crate) fn redo_inflight_request(
         &mut self,
         req: &InflightRequests,
+        previous: PeerId,
     ) -> Result<(), WireError> {
         match req {
             InflightRequests::UtreexoProof(block_hash) => {
-                if !self.has_utreexo_peers() {
+                if !self.has_block_proof_peers() {
                     return Ok(());
                 }
 
@@ -652,9 +702,10 @@ where
                     return Ok(());
                 }
 
-                let peer = self.send_to_fast_peer(
+                let peer = self.send_block_proof_request(
+                    *block_hash,
                     NodeRequest::GetBlockProof((*block_hash, Bitmap::new(), Bitmap::new())),
-                    service_flags::UTREEXO.into(),
+                    Some(previous),
                 )?;
 
                 self.inflight.insert(
@@ -714,11 +765,12 @@ where
 
     /// Saves the utreexo peers to disk so we can reconnect with them later
     pub(crate) fn save_utreexo_peers(&self) -> Result<(), WireError> {
-        let peers: &Vec<u32> = self
-            .peer_by_service
-            .get(&service_flags::UTREEXO.into())
-            .ok_or(WireError::NoUtreexoPeersAvailable)?;
-        let peers_usize: Vec<usize> = peers.iter().map(|&peer| peer as usize).collect();
+        let peers_usize: Vec<usize> = self
+            .peers
+            .values()
+            .filter(|peer| peer.state == PeerStatus::Ready && peer.serves_block_proofs())
+            .map(|peer| peer.address_id as usize)
+            .collect();
         if peers_usize.is_empty() {
             warn!("No connected Utreexo peers to save to disk");
             return Ok(());
@@ -798,6 +850,18 @@ where
 
         let metrics = get_metrics();
         metrics.peer_count.set(self.peer_ids.len() as f64);
+    }
+
+    pub(crate) fn has_historical_proof_peer(&self) -> bool {
+        self.peers
+            .values()
+            .any(|peer| peer.state == PeerStatus::Ready && peer.serves_historical_proofs())
+    }
+
+    pub(crate) fn has_block_proof_peers(&self) -> bool {
+        self.peers
+            .values()
+            .any(|peer| peer.state == PeerStatus::Ready && peer.serves_block_proofs())
     }
 
     pub(crate) fn has_utreexo_peers(&self) -> bool {

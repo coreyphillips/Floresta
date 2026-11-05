@@ -27,6 +27,7 @@ use bitcoin::Network;
 use bitcoin::Txid;
 pub(crate) use blocks::InflightBlock;
 use floresta_chain::ChainBackend;
+use floresta_common::service_flags;
 use floresta_common::Ema;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
@@ -228,8 +229,22 @@ pub struct LocalPeerView {
 }
 
 impl LocalPeerView {
+    pub(crate) fn serves_block_proofs(&self) -> bool {
+        self.services.has(service_flags::UTREEXO.into())
+            || self.services.has(service_flags::UTREEXO_ARCHIVE.into())
+    }
+
+    fn serves_historical_proofs(&self) -> bool {
+        self.services.has(service_flags::UTREEXO_ARCHIVE.into())
+            || self
+                .services
+                .has(ServiceFlags::NETWORK | service_flags::UTREEXO.into())
+    }
+
     pub(crate) fn serves_block_bodies(&self) -> bool {
-        self.services.has(ServiceFlags::NETWORK) || self.services.has(ServiceFlags::NETWORK_LIMITED)
+        self.services.has(ServiceFlags::WITNESS)
+            && (self.services.has(ServiceFlags::NETWORK)
+                || self.services.has(ServiceFlags::NETWORK_LIMITED))
     }
 
     /// Whether this is a manually added peer
@@ -251,6 +266,8 @@ impl LocalPeerView {
 pub struct NodeCommon<Chain: ChainBackend> {
     // 1. Core Blockchain and Transient Data
     pub(crate) chain: Chain,
+    // A partial chain replays an earlier interval and has no hash-to-height index.
+    pub(crate) historical_replay: bool,
     pub(crate) blocks: HashMap<BlockHash, InflightBlock>,
     pub(crate) mempool: Arc<tokio::sync::Mutex<Mempool>>,
     pub(crate) block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
@@ -370,6 +387,7 @@ where
                 last_block_request: chain.get_validation_index().expect("Invalid chain"),
                 chain,
                 peer_ids: Vec::new(),
+                historical_replay: false,
                 peer_by_service: HashMap::new(),
                 mempool,
                 network: config.network,

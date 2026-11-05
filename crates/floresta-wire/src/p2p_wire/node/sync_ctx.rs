@@ -2,6 +2,7 @@
 
 //! A node that downloads and validates the blockchain.
 
+use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -22,6 +23,7 @@ use crate::node::ConnectionKind;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
 use crate::node::NodeRequest;
+use crate::node::PeerStatus;
 use crate::node::UtreexoNode;
 use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
@@ -149,11 +151,27 @@ where
     fn check_connections(&mut self) -> Result<(), WireError> {
         let total_peers = self.connected_peers();
         let utreexo_peers = self
-            .peer_by_service
-            .get(&service_flags::UTREEXO.into())
-            .map_or(0, |peers| peers.len());
+            .peers
+            .values()
+            .filter(|peer| peer.state == PeerStatus::Ready && peer.serves_block_proofs())
+            .map(|peer| peer.address)
+            .collect::<HashSet<_>>()
+            .len();
+        let need_archive = !self.has_historical_proof_peer()
+            && (self.historical_replay
+                || self
+                    .chain
+                    .get_best_block()?
+                    .0
+                    .saturating_sub(self.chain.get_validation_index()?)
+                    >= 288);
+        let body_peers = self
+            .peers
+            .values()
+            .filter(|peer| peer.state == PeerStatus::Ready && peer.serves_block_bodies())
+            .count();
 
-        if utreexo_peers < 2 && total_peers >= SyncNode::MAX_OUTGOING_PEERS {
+        if (utreexo_peers < 2 || need_archive) && total_peers >= SyncNode::MAX_OUTGOING_PEERS {
             // if we have more than the maximum number of outgoing peers, disconnect
             // some non-utreexo peers.
             //
@@ -162,12 +180,20 @@ where
             self.peers
                 .values()
                 .filter(|peer| {
-                    peer.is_regular_peer() && !peer.services.has(service_flags::UTREEXO.into())
+                    peer.is_regular_peer()
+                        && (!peer.serves_block_proofs() || (need_archive && utreexo_peers > 1))
+                        && (!peer.serves_block_bodies() || body_peers > 1)
                 })
                 .choose(&mut thread_rng())
                 .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
         }
 
+        if body_peers == 0 {
+            self.maybe_open_connection(ServiceFlags::NETWORK)?;
+        }
+        if need_archive {
+            self.maybe_open_connection(service_flags::UTREEXO_ARCHIVE.into())?;
+        }
         if utreexo_peers < 2 {
             info!("Not enough utreexo peers (we have {utreexo_peers}), opening a new connection");
             self.maybe_open_connection(service_flags::UTREEXO.into())?;
@@ -307,7 +333,7 @@ where
         }
 
         try_and_log!(self.process_pending_blocks());
-        if !self.has_utreexo_peers() {
+        if !self.has_block_proof_peers() {
             return LoopControl::Continue;
         }
 

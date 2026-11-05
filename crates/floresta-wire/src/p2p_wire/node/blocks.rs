@@ -11,7 +11,6 @@ use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
 use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
-use floresta_common::service_flags;
 use rustreexo::proof::Proof;
 use tracing::debug;
 use tracing::error;
@@ -98,8 +97,10 @@ where
             return Ok(());
         }
 
-        let peer =
-            self.send_to_fast_peer(NodeRequest::GetBlock(blocks.clone()), ServiceFlags::NETWORK)?;
+        let peer = self.send_to_fast_peer(
+            NodeRequest::GetBlock(blocks.clone()),
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        )?;
 
         for block in blocks.iter() {
             self.inflight
@@ -130,9 +131,10 @@ where
 
         // We only need auxiliary utreexo data if there are non-coinbase transactions
         if txdata_len != 1 {
-            let utreexo_peer = self.send_to_fast_peer(
+            let utreexo_peer = self.send_block_proof_request(
+                block_hash,
                 NodeRequest::GetBlockProof((block_hash, Bitmap::new(), Bitmap::new())),
-                service_flags::UTREEXO.into(),
+                None,
             )?;
 
             self.inflight.insert(
@@ -179,7 +181,7 @@ where
     /// while we didn't have more utreexo peers to redo the request.
     pub(crate) fn ask_for_missed_proofs(&mut self) -> Result<(), WireError> {
         // If we have no peers, we can't ask for proofs
-        if !self.has_utreexo_peers() {
+        if !self.has_block_proof_peers() {
             return Ok(());
         }
 
@@ -203,9 +205,10 @@ where
             .collect::<Vec<_>>();
 
         for block_hash in pending_blocks {
-            let peer = self.send_to_fast_peer(
+            let peer = self.send_block_proof_request(
+                block_hash,
                 NodeRequest::GetBlockProof((block_hash, Bitmap::new(), Bitmap::new())),
-                service_flags::UTREEXO.into(),
+                None,
             )?;
 
             self.inflight.insert(
