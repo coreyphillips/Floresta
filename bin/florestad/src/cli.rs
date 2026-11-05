@@ -52,6 +52,14 @@ pub struct Cli {
     #[arg(long, requires = "data_dir", conflicts_with = "managed_stdio")]
     pub managed_cleanup_for: Option<String>,
 
+    /// Build-bound fingerprint to verify under the managed database lock.
+    #[arg(long, requires = "managed_stdio")]
+    pub managed_store_owner: Option<String>,
+
+    /// Publish the next owner only after a complete guarded offline removal.
+    #[arg(long, requires = "managed_cleanup_for")]
+    pub managed_next_owner: Option<String>,
+
     #[arg(long)]
     /// Whether Compact Block Filters should be disabled
     ///

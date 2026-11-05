@@ -2,16 +2,16 @@
 
 //! Offline cleanup under the same OS lock as a running managed node.
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
 use bitcoin::Network;
-use rustix::fs::{fstatfs, openat, unlinkat, AtFlags, Dir, Mode, OFlags, CWD};
+use rustix::fs::{fstatfs, openat, renameat, unlinkat, AtFlags, Dir, Mode, OFlags, CWD};
 
 const LOCK: &str = "chicory-managed.lock";
 const PENDING: &str = "chicory-removal-pending";
-const OWNER: &str = "chicory-owner.json";
+use crate::managed_owner::{self, FILE as OWNER};
 
 fn refuse() -> io::Error {
     io::Error::other("Unrecognized or unavailable managed store")
@@ -220,20 +220,23 @@ fn walk(dir: &File, layout: Layout, dev: u64, deleting: bool) -> io::Result<()> 
     Ok(())
 }
 
-pub(crate) fn remove(root: &str, store: &str, network: Network, owner: &str) -> io::Result<()> {
+pub(crate) fn remove(
+    root: &str,
+    store: &str,
+    network: Network,
+    owner: &str,
+    next_owner: Option<&str>,
+) -> io::Result<()> {
+    let expected = managed_owner::marker(network, owner)?;
+    let next = next_owner
+        .map(|id| managed_owner::marker(network, id))
+        .transpose()?;
     let network = match network {
         Network::Bitcoin => "mainnet",
         Network::Testnet => "testnet",
         Network::Regtest => "regtest",
         _ => return Err(refuse()),
     };
-    if owner.len() != 64
-        || !owner
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Err(refuse());
-    }
     let root = Path::new(root);
     let store = Path::new(store);
     let base = root.parent().ok_or_else(refuse)?;
@@ -272,16 +275,8 @@ pub(crate) fn remove(root: &str, store: &str, network: Network, owner: &str) -> 
     private_dir(&directory, dev)?;
     let root_fd = open_dir(&directory, network)?;
     private_dir(&root_fd, dev)?;
-    let marker = file_at(&root_fd, OWNER, dev, OFlags::RDONLY)?;
-    let expected =
-        format!(r#"{{"format":"chicory-floresta/1","network":"{network}","profile":"{owner}"}}"#);
-    let mut bytes = Vec::new();
-    marker.take(1024).read_to_end(&mut bytes)?;
-    if bytes != expected.as_bytes() {
-        return Err(refuse());
-    }
     let store = if store == root {
-        root_fd
+        root_fd.try_clone()?
     } else {
         open_dir(
             &root_fd,
@@ -296,28 +291,45 @@ pub(crate) fn remove(root: &str, store: &str, network: Network, owner: &str) -> 
     // Never unlink the lock inode or its ancestors, even after an interrupted removal.
     let lock = file_at(&store, LOCK, dev, OFlags::RDWR)?;
     fs2::FileExt::try_lock_exclusive(&lock)?;
+    // Re-read after locking: another helper may have finished rebinding this directory.
+    let marker = file_at(&root_fd, OWNER, dev, OFlags::RDONLY)?;
+    let mut bytes = Vec::new();
+    marker.take(1025).read_to_end(&mut bytes)?;
+    if bytes != expected.as_bytes() {
+        return Err(refuse());
+    }
     walk(&store, Layout::Root, dev, false)?;
-    match open_child(
+    let mut pending = match open_child(
         &store,
         PENDING,
-        OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     ) {
-        Ok(file) => File::from(file).sync_all()?,
-        Err(rustix::io::Errno::EXIST) => {
-            if file_at(&store, PENDING, dev, OFlags::RDONLY)?
-                .metadata()?
-                .len()
-                != 0
-            {
-                return Err(refuse());
-            }
-        }
-        Err(e) => return Err(e.into()),
+        Ok(file) => File::from(file),
+        Err(rustix::io::Errno::EXIST) => file_at(&store, PENDING, dev, OFlags::RDWR)?,
+        Err(error) => return Err(error.into()),
+    };
+    // Before deletion this marker is empty. A crash during the final write may
+    // leave a prefix of the requested replacement. Resume at exactly that byte.
+    let mut prefix = Vec::new();
+    (&mut pending).take(1025).read_to_end(&mut prefix)?;
+    let replacement = next.as_deref().unwrap_or("").as_bytes();
+    if !replacement.starts_with(&prefix) {
+        return Err(refuse());
     }
+    pending.sync_all()?;
     store.sync_all()?;
     walk(&store, Layout::Root, dev, true)?;
     store.sync_all()?;
-    unlinkat(&store, PENDING, AtFlags::empty())?;
+    if next.is_some() {
+        pending.write_all(&replacement[prefix.len()..])?;
+        pending.sync_all()?;
+        // This rename publishes the new owner and clears the startup veto as
+        // one filesystem operation, without changing the running lock inode.
+        renameat(&store, PENDING, &root_fd, OWNER)?;
+        root_fd.sync_all()?;
+    } else {
+        unlinkat(&store, PENDING, AtFlags::empty())?;
+    }
     store.sync_all()
 }

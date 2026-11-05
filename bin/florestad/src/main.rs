@@ -21,6 +21,7 @@ mod cli;
 mod daemonize;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod managed_cleanup;
+mod managed_owner;
 
 use std::env;
 use std::fs;
@@ -64,6 +65,7 @@ fn main() {
             &data_dir,
             params.network,
             &owner,
+            params.managed_next_owner.as_deref(),
         )
         .is_ok()
         {
@@ -117,6 +119,15 @@ fn main() {
     });
 
     if managed {
+        let root = std::path::Path::new(params.data_dir.as_deref().unwrap());
+        if managed_owner::check(root, params.network, params.managed_store_owner.as_deref())
+            .is_err()
+        {
+            eprintln!(
+                "Managed store owner or build differs. Rebuild or reconnect the original storage."
+            );
+            exit(1);
+        }
         let marker = PathBuf::from(&data_dir).join("chicory-removal-pending");
         if !matches!(fs::symlink_metadata(marker), Err(e) if e.kind() == io::ErrorKind::NotFound) {
             eprintln!("Finish removing managed storage before restarting this node.");
