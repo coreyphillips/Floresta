@@ -48,6 +48,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
@@ -71,6 +73,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::address_man::AddressState;
 use crate::block_proof::Bitmap;
 use crate::node::periodic_job;
 use crate::node::try_and_log;
@@ -78,6 +81,7 @@ use crate::node::InflightBlock;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
 use crate::node::NodeRequest;
+use crate::node::PeerStatus;
 use crate::node::UtreexoNode;
 use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
@@ -99,6 +103,9 @@ pub struct ChainSelector {
 
     /// Keep track each peer's tip
     tip_cache: HashMap<PeerId, BlockHash>,
+
+    /// Fork-header requests belong to one peer and expire unless that peer makes progress.
+    pending_headers: HashMap<PeerId, (BlockHash, Instant)>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -182,6 +189,7 @@ where
                 error!("Error while downloading headers from peer={peer} err={e}");
 
                 self.disconnect_and_ban(peer)?;
+                return Err(e.into());
             }
         }
 
@@ -193,6 +201,19 @@ where
             .or_insert(last);
 
         self.last_tip_update = Instant::now();
+        if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
+            self.context.done_peers.remove(&peer);
+            // Repeating the requested tip is not progress and must not renew the deadline.
+            if self
+                .context
+                .pending_headers
+                .get(&peer)
+                .is_some_and(|(tip, _)| *tip != last)
+            {
+                self.request_fork_headers(peer, last)?;
+            }
+            return Ok(());
+        }
         self.request_headers(last)
     }
 
@@ -601,52 +622,119 @@ where
         match self.context.state {
             ChainSelectorState::DownloadingHeaders => {
                 info!("Finished downloading headers from peer={peer}, checking if our peers agree");
-                self.poke_peers()?;
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
                 self.context.done_peers.insert(peer);
+                self.poke_peers()?;
+                self.finish_header_agreement().await?;
             }
             ChainSelectorState::LookingForForks(_) => {
+                self.context.pending_headers.remove(&peer);
                 self.context.done_peers.insert(peer);
-                for peer in self.common.peer_ids.iter() {
-                    // at least one peer haven't finished
-                    if !self.context.done_peers.contains(peer) {
-                        return Ok(());
-                    }
-                }
-
-                if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
-                    self.context.state = ChainSelectorState::Done;
-                    // already assumed the chain
-                    if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
-                        return Ok(());
-                    }
-                    info!(
-                        "Assuming chain with height={} tip={}",
-                        assume_utreexo.height, assume_utreexo.block_hash
-                    );
-                    let acc = Stump {
-                        leaves: assume_utreexo.leaves,
-                        roots: assume_utreexo.roots.clone(),
-                    };
-                    self.chain
-                        .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
-                    return Ok(());
-                }
-
-                let has_peers = self
-                    .peer_by_service
-                    .contains_key(&service_flags::UTREEXO_ARCHIVE.into());
-
-                if self.config.pow_fraud_proofs && has_peers {
-                    self.check_tips().await?;
-                }
-
-                self.context.state = ChainSelectorState::Done;
+                self.finish_header_agreement().await?;
             }
             _ => {}
         }
-
         Ok(())
+    }
+
+    fn header_peers(&self) -> Vec<PeerId> {
+        self.peer_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.peers
+                    .get(id)
+                    .is_some_and(|peer| peer.state == PeerStatus::Ready && peer.is_long_lived())
+            })
+            .collect()
+    }
+
+    async fn finish_header_agreement(&mut self) -> Result<(), WireError> {
+        if !matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
+            return Ok(());
+        }
+        let peers = self.header_peers();
+        self.context.done_peers.retain(|peer| peers.contains(peer));
+        self.context
+            .pending_headers
+            .retain(|peer, _| peers.contains(peer));
+        if peers.is_empty() {
+            self.context.state = ChainSelectorState::CreatingConnections;
+            return Ok(());
+        }
+        if peers
+            .iter()
+            .any(|peer| !self.context.done_peers.contains(peer))
+            || !self.context.pending_headers.is_empty()
+        {
+            return Ok(());
+        }
+
+        if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
+            if self.chain.get_validation_index()? < assume_utreexo.height {
+                info!(
+                    "Assuming chain with height={} tip={}",
+                    assume_utreexo.height, assume_utreexo.block_hash
+                );
+                let acc = Stump {
+                    leaves: assume_utreexo.leaves,
+                    roots: assume_utreexo.roots.clone(),
+                };
+                self.chain
+                    .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
+            }
+            // A missing checkpoint must not leave the selector marked complete after an error.
+            self.context.state = ChainSelectorState::Done;
+            return Ok(());
+        }
+
+        let has_peers = self
+            .peer_by_service
+            .get(&service_flags::UTREEXO_ARCHIVE.into())
+            .is_some_and(|peers| !peers.is_empty());
+        if self.config.pow_fraud_proofs && has_peers {
+            self.check_tips().await?;
+        }
+        self.context.state = ChainSelectorState::Done;
+        Ok(())
+    }
+
+    fn request_fork_headers(&mut self, peer: PeerId, tip: BlockHash) -> Result<(), WireError> {
+        let locator = self.chain.get_block_locator_for_tip(tip)?;
+        self.context
+            .pending_headers
+            .insert(peer, (tip, Instant::now()));
+        self.send_to_peer(peer, NodeRequest::GetHeaders(locator))
+    }
+
+    async fn expire_header_checks(&mut self) -> Result<(), WireError> {
+        let expired: Vec<_> = self
+            .context
+            .pending_headers
+            .iter()
+            .filter(|(_, (_, time))| time.elapsed().as_secs() > ChainSelector::REQUEST_TIMEOUT)
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in expired {
+            self.context.pending_headers.remove(&peer);
+            self.context.done_peers.remove(&peer);
+            self.context.tip_cache.remove(&peer);
+            let Some(address_id) = self.peers.get(&peer).map(|peer| peer.address_id) else {
+                continue;
+            };
+            warn!("Peer {peer} timed out during header agreement");
+            let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+            // Common removal can report a failed retry after removing the peer. Still set
+            // the retry cooldown and reevaluate the remaining header responders below.
+            try_and_log!(self.handle_disconnection(peer, address_id));
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.address_man
+                .update_set_state(address_id, AddressState::Failed(now));
+        }
+        self.finish_header_agreement().await
     }
 
     async fn is_our_chain_invalid(&mut self, other_tip: BlockHash) -> Result<(), WireError> {
@@ -661,7 +749,11 @@ where
         // Fraud challenges need the same peer to supply the block and its proof.
         let rand_peer = *peers
             .iter()
-            .filter(|id| self.peers.get(id).is_some_and(|peer| peer.serves_block_bodies()))
+            .filter(|id| {
+                self.peers
+                    .get(id)
+                    .is_some_and(|peer| peer.serves_block_bodies())
+            })
             .choose(&mut thread_rng())
             .ok_or(WireError::NoPeersAvailable)?;
 
@@ -763,13 +855,14 @@ where
     /// agree with our sync peer on what is the best chain. If they are in a fork,
     /// we'll download that fork and compare with our own chain. We should always pick
     /// the most PoW one.
-    fn poke_peers(&self) -> Result<(), WireError> {
-        let locator = self.chain.get_block_locator().unwrap();
-        for peer in self.common.peer_ids.iter() {
-            let get_headers = NodeRequest::GetHeaders(locator.clone());
-            self.send_to_peer(*peer, get_headers)?;
+    fn poke_peers(&mut self) -> Result<(), WireError> {
+        let tip = self.chain.get_best_block()?.1;
+        for peer in self.header_peers() {
+            if !self.context.done_peers.contains(&peer) {
+                // A closed channel must not prevent the other peers from being queried.
+                try_and_log!(self.request_fork_headers(peer, tip));
+            }
         }
-
         Ok(())
     }
 
@@ -846,11 +939,8 @@ where
             no_log,
         );
 
-        if let ChainSelectorState::LookingForForks(start) = self.context.state {
-            if start.elapsed().as_secs() > ChainSelector::REQUEST_TIMEOUT {
-                self.context.state = ChainSelectorState::LookingForForks(Instant::now());
-                self.poke_peers()?;
-            }
+        if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
+            self.expire_header_checks().await?;
         }
 
         if let ChainSelectorState::DownloadingHeaders = self.context.state {
@@ -890,7 +980,9 @@ where
     ) -> Result<FindAccResult, WireError> {
         for peer_id in self.common.peer_ids.iter() {
             let peer = self.peers.get(peer_id).unwrap();
-            if peer.services.has(service_flags::UTREEXO_ARCHIVE.into()) && peer.serves_block_bodies() {
+            if peer.services.has(service_flags::UTREEXO_ARCHIVE.into())
+                && peer.serves_block_bodies()
+            {
                 self.send_to_peer(*peer_id, NodeRequest::GetUtreexoState((block, height)))?;
                 self.common.inflight.insert(
                     InflightRequests::UtreexoState(*peer_id),
@@ -1004,23 +1096,55 @@ where
 
         match unhandled {
             PeerMessages::Headers(headers) => {
-                self.inflight.remove(&InflightRequests::Headers);
+                if !self
+                    .peers
+                    .get(&peer)
+                    .is_some_and(|peer| peer.state == PeerStatus::Ready)
+                {
+                    return Ok(());
+                }
+                match self.context.state {
+                    ChainSelectorState::DownloadingHeaders => {
+                        if !self
+                            .inflight
+                            .get(&InflightRequests::Headers)
+                            .is_some_and(|(owner, _)| *owner == peer)
+                        {
+                            return Ok(());
+                        }
+                        self.inflight.remove(&InflightRequests::Headers);
+                    }
+                    ChainSelectorState::LookingForForks(_) => {
+                        if !self.context.pending_headers.contains_key(&peer) {
+                            return Ok(());
+                        }
+                    }
+                    _ => return Ok(()),
+                }
                 return self.handle_headers(peer, headers).await;
             }
 
             PeerMessages::Ready(version) => {
                 self.handle_peer_ready(peer, version)?;
-                if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
-                    let locator = self.chain.get_block_locator().unwrap();
-                    self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
+                if matches!(self.context.state, ChainSelectorState::LookingForForks(_))
+                    && self.header_peers().contains(&peer)
+                    && !self.context.pending_headers.contains_key(&peer)
+                    && !self.context.done_peers.contains(&peer)
+                {
+                    self.request_fork_headers(peer, self.chain.get_best_block()?.1)?;
                 }
             }
 
             PeerMessages::Disconnected(idx) => {
-                if self.peers.is_empty() {
+                self.context.pending_headers.remove(&peer);
+                self.context.done_peers.remove(&peer);
+                self.context.tip_cache.remove(&peer);
+                try_and_log!(self.handle_disconnection(peer, idx));
+                if self.header_peers().is_empty() {
                     self.context.state = ChainSelectorState::CreatingConnections;
+                } else {
+                    self.finish_header_agreement().await?;
                 }
-                self.handle_disconnection(peer, idx)?;
             }
 
             // During chain selection we don't ask for blocks, unless it's an explicit
@@ -1038,5 +1162,372 @@ where
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use std::sync::Arc;
+
+    use bitcoin::p2p::address::AddrV2;
+    use floresta_chain::pruned_utreexo::chainparams::AssumeUtreexoValue;
+    use floresta_chain::pruned_utreexo::BlockchainInterface;
+    use floresta_chain::pruned_utreexo::UpdatableChainstate;
+    use floresta_chain::AssumeValidArg;
+    use floresta_chain::ChainState;
+    use floresta_chain::FlatChainStore;
+    use floresta_chain::FlatChainStoreConfig;
+    use floresta_common::Ema;
+    use floresta_mempool::Mempool;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+    use tokio::sync::{Mutex, RwLock};
+
+    use super::*;
+    use crate::address_man::{AddressMan, AddressState, LocalAddress};
+    use crate::node::{ConnectionKind, LocalPeerView, PeerStatus};
+    use crate::p2p_wire::tests::utils::{get_node_config, signet_headers, signet_roots};
+    use crate::p2p_wire::transport::TransportProtocol;
+
+    type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, ChainSelector>;
+
+    fn fixture() -> (tempfile::TempDir, TestNode) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_owned();
+        let store = FlatChainStore::new(FlatChainStoreConfig::new(path.clone())).unwrap();
+        let chain = Arc::new(ChainState::new(
+            store,
+            Network::Signet,
+            AssumeValidArg::Disabled,
+        ));
+        let hash = signet_headers()[1].block_hash();
+        chain.accept_header(signet_headers()[1]).unwrap();
+        let stump = TestNode::parse_acc(signet_roots()[&hash].clone()).unwrap();
+        let mut config = get_node_config(path, Network::Signet, false);
+        config.disable_dns_seeds = true;
+        config.assume_utreexo = Some(AssumeUtreexoValue {
+            block_hash: hash,
+            height: 1,
+            roots: stump.roots,
+            leaves: stump.leaves,
+        });
+        let node = TestNode::new(
+            config,
+            chain,
+            Arc::new(Mutex::new(Mempool::new(1000))),
+            None,
+            Arc::new(RwLock::new(false)),
+            AddressMan::new(None, &[crate::address_man::ReachableNetworks::IPv4]),
+        )
+        .unwrap();
+        (dir, node)
+    }
+
+    fn peer(node: &mut TestNode, id: u32) -> UnboundedReceiver<NodeRequest> {
+        let (channel, receiver) = unbounded_channel();
+        let services =
+            ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+        let ip = std::net::Ipv4Addr::new(8, 8, 8, id as u8);
+        let mut address = LocalAddress::from(AddrV2::Ipv4(ip));
+        address.set_services(services);
+        node.address_man.push_addresses(&[address.clone()]);
+        node.address_man
+            .update_set_state(address.id, AddressState::Connected);
+        let mut latency = Ema::with_half_life_50();
+        latency.add(id as f64);
+        node.peers.insert(
+            id,
+            LocalPeerView {
+                message_times: latency,
+                state: PeerStatus::Ready,
+                address_id: address.id,
+                channel,
+                services,
+                user_agent: "fixture".into(),
+                address: ip.into(),
+                port: 8333,
+                _last_message: Instant::now(),
+                kind: ConnectionKind::Regular(services),
+                height: 1,
+                banscore: 0,
+                transport_protocol: TransportProtocol::V2,
+            },
+        );
+        node.peer_ids.push(id);
+        node.peer_by_service
+            .entry(ServiceFlags::NETWORK)
+            .or_default()
+            .push(id);
+        receiver
+    }
+
+    async fn start_checks(node: &mut TestNode) {
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.inflight
+            .insert(InflightRequests::Headers, (1, Instant::now()));
+        node.handle_peer_notification(PeerMessages::Headers(vec![]), 1, Instant::now())
+            .await
+            .unwrap();
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+    }
+
+    fn expire_checks(node: &mut TestNode) {
+        for (_, time) in node.context.pending_headers.values_mut() {
+            *time = Instant::now() - Duration::from_secs(ChainSelector::REQUEST_TIMEOUT + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_header_peer_is_removed_before_checkpoint_adoption() {
+        let (_dir, mut node) = fixture();
+        let mut ready = peer(&mut node, 1);
+        let mut silent = peer(&mut node, 2);
+        start_checks(&mut node).await;
+        while ready.try_recv().is_ok() {}
+        while silent.try_recv().is_ok() {}
+        let address_id = node.peers[&2].address_id;
+        expire_checks(&mut node);
+        node.maintenance_tick().await.unwrap();
+        assert!(
+            !node.peers.contains_key(&2),
+            "a silent peer must leave the agreement set"
+        );
+        assert_eq!(node.context.state, ChainSelectorState::Done);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 1);
+        assert!(matches!(silent.try_recv().unwrap(), NodeRequest::Shutdown));
+        assert_eq!(
+            node.address_man
+                .manual_endpoint(AddrV2::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 2)), 8333)
+                .id,
+            address_id
+        );
+        assert!(node
+            .address_man
+            .get_address_to_connect(ServiceFlags::NETWORK, false)
+            .is_none());
+        // A delayed notification from the retired actor must not undo its failure cooldown.
+        node.handle_peer_notification(PeerMessages::Disconnected(address_id), 2, Instant::now())
+            .await
+            .unwrap();
+        assert!(node
+            .address_man
+            .get_address_to_connect(ServiceFlags::NETWORK, false)
+            .is_none());
+        assert_eq!(node.context.state, ChainSelectorState::Done);
+    }
+
+    #[tokio::test]
+    async fn disconnecting_last_unfinished_peer_completes_header_agreement() {
+        let (_dir, mut node) = fixture();
+        let _ready = peer(&mut node, 1);
+        let _unfinished = peer(&mut node, 2);
+        start_checks(&mut node).await;
+        let address_id = node.peers[&2].address_id;
+        node.handle_peer_notification(PeerMessages::Disconnected(address_id), 2, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(node.context.state, ChainSelectorState::Done);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn losing_all_header_peers_restarts_bootstrap_without_assuming() {
+        let (_dir, mut node) = fixture();
+        let _ready = peer(&mut node, 1);
+        let _unfinished = peer(&mut node, 2);
+        start_checks(&mut node).await;
+        for id in [1, 2] {
+            let address_id = node.peers[&id].address_id;
+            node.handle_peer_notification(
+                PeerMessages::Disconnected(address_id),
+                id,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(node.context.state, ChainSelectorState::CreatingConnections);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn fork_header_continuation_stays_with_its_source_and_blocks_completion() {
+        let (_dir, mut node) = fixture();
+        let mut finished = peer(&mut node, 1);
+        let mut alternate = peer(&mut node, 2);
+        start_checks(&mut node).await;
+        while finished.try_recv().is_ok() {}
+        while alternate.try_recv().is_ok() {}
+        let next = signet_headers()[2];
+        node.handle_peer_notification(PeerMessages::Headers(vec![next]), 2, Instant::now())
+            .await
+            .unwrap();
+        let request = alternate
+            .try_recv()
+            .expect("continue examining the responding peer's chain");
+        assert!(
+            matches!(request, NodeRequest::GetHeaders(locator) if locator[0] == next.block_hash())
+        );
+        assert!(finished.try_recv().is_err());
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
+    }
+    #[tokio::test]
+    async fn unsolicited_empty_headers_cannot_end_initial_download() {
+        let (_dir, mut node) = fixture();
+        let _downloader = peer(&mut node, 1);
+        let _other = peer(&mut node, 2);
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.inflight
+            .insert(InflightRequests::Headers, (1, Instant::now()));
+        node.handle_peer_notification(PeerMessages::Headers(vec![]), 2, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert_eq!(node.inflight[&InflightRequests::Headers].0, 1);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoint_cannot_mark_header_agreement_done() {
+        let (_dir, mut node) = fixture();
+        let _ready = peer(&mut node, 1);
+        let _other = peer(&mut node, 2);
+        let checkpoint = node.config.assume_utreexo.as_mut().unwrap();
+        checkpoint.height = 2;
+        checkpoint.block_hash = signet_headers()[2].block_hash();
+        start_checks(&mut node).await;
+        assert!(node
+            .handle_peer_notification(PeerMessages::Headers(vec![]), 2, Instant::now())
+            .await
+            .is_err());
+        assert_ne!(node.context.state, ChainSelectorState::Done);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn fork_progress_renews_only_its_peer_and_duplicate_headers_do_not() {
+        let (_dir, mut node) = fixture();
+        let _finished = peer(&mut node, 1);
+        let mut progressing = peer(&mut node, 2);
+        let _silent = peer(&mut node, 3);
+        start_checks(&mut node).await;
+        while progressing.try_recv().is_ok() {}
+        expire_checks(&mut node);
+        let silent_deadline = node.context.pending_headers[&3].1;
+        let next = signet_headers()[2];
+        node.handle_peer_notification(PeerMessages::Headers(vec![next]), 2, Instant::now())
+            .await
+            .unwrap();
+        let renewed = node.context.pending_headers[&2].1;
+        assert!(renewed > silent_deadline);
+        assert_eq!(node.context.pending_headers[&3].1, silent_deadline);
+        assert!(matches!(
+            progressing.try_recv().unwrap(),
+            NodeRequest::GetHeaders(_)
+        ));
+        node.handle_peer_notification(PeerMessages::Headers(vec![next]), 2, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(node.context.pending_headers[&2].1, renewed);
+        assert!(progressing.try_recv().is_err());
+        node.maintenance_tick().await.unwrap();
+        assert!(!node.peers.contains_key(&3));
+        assert!(node.peers.contains_key(&2));
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
+        node.handle_peer_notification(PeerMessages::Headers(vec![]), 2, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(node.context.state, ChainSelectorState::Done);
+        assert_eq!(node.chain.get_best_block().unwrap().0, 2);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_unready_and_completed_header_replies_cannot_finish_a_pending_fork() {
+        let (_dir, mut node) = fixture();
+        let _finished = peer(&mut node, 1);
+        let _pending = peer(&mut node, 2);
+        let _unready = peer(&mut node, 3);
+        node.peers.get_mut(&3).unwrap().state = PeerStatus::Awaiting;
+        start_checks(&mut node).await;
+        let original = node.context.pending_headers[&2];
+        for id in [99, 3, 1] {
+            node.handle_peer_notification(PeerMessages::Headers(vec![]), id, Instant::now())
+                .await
+                .unwrap();
+        }
+        node.handle_peer_notification(
+            PeerMessages::Headers(vec![signet_headers()[2]]),
+            1,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.context.pending_headers[&2], original);
+        assert!(!node.context.done_peers.contains(&99));
+        assert!(!node.context.done_peers.contains(&3));
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+        assert_eq!(node.chain.get_best_block().unwrap().0, 1);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn timing_out_the_last_header_peer_restarts_without_assuming() {
+        let (_dir, mut node) = fixture();
+        let _finished = peer(&mut node, 1);
+        let _silent = peer(&mut node, 2);
+        start_checks(&mut node).await;
+        let id = node.peers[&1].address_id;
+        node.handle_peer_notification(PeerMessages::Disconnected(id), 1, Instant::now())
+            .await
+            .unwrap();
+        expire_checks(&mut node);
+        node.maintenance_tick().await.unwrap();
+        assert!(node.peers.is_empty());
+        assert_eq!(node.context.state, ChainSelectorState::CreatingConnections);
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
+        node.handle_peer_notification(PeerMessages::Headers(vec![]), 2, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(node.context.state, ChainSelectorState::CreatingConnections);
+    }
+
+    #[tokio::test]
+    async fn invalid_fork_headers_cannot_renew_a_banned_peer_or_adopt_a_checkpoint() {
+        use bitcoin::hashes::Hash;
+        let (_dir, mut node) = fixture();
+        let _finished = peer(&mut node, 1);
+        let mut invalid = peer(&mut node, 2);
+        start_checks(&mut node).await;
+        while invalid.try_recv().is_ok() {}
+        let original = node.context.pending_headers[&2];
+        let mut header = signet_headers()[2];
+        header.prev_blockhash = BlockHash::all_zeros();
+        assert!(node
+            .handle_peer_notification(PeerMessages::Headers(vec![header]), 2, Instant::now())
+            .await
+            .is_err());
+        assert_eq!(node.peers[&2].state, PeerStatus::Banned);
+        assert_eq!(node.context.pending_headers[&2], original);
+        assert!(matches!(invalid.try_recv().unwrap(), NodeRequest::Shutdown));
+        assert!(invalid.try_recv().is_err());
+        node.handle_peer_notification(PeerMessages::Headers(vec![]), 2, Instant::now())
+            .await
+            .unwrap();
+        assert!(!node.context.done_peers.contains(&2));
+        assert_eq!(node.chain.get_validation_index().unwrap(), 0);
     }
 }
