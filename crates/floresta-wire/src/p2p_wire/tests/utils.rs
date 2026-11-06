@@ -696,3 +696,117 @@ async fn archival_routes_cover_history_live_boundary_and_retries() {
     drop(node);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn body_timeout_old_hash(
+    node: &mut UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+) -> bitcoin::BlockHash {
+    let mut header = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+    let mut requested = header.block_hash();
+    for height in 1..=289 {
+        header.prev_blockhash = header.block_hash();
+        header.time += 600;
+        header.nonce = 0;
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        node.chain.accept_header(header).unwrap();
+        if height == 1 {
+            requested = header.block_hash();
+        }
+    }
+    requested
+}
+
+#[tokio::test]
+async fn body_timeout_retries_another_historical_provider() {
+    let (dir, mut node) = routing_node();
+    let hash = body_timeout_old_hash(&mut node);
+    // A limited peer cannot serve this historical body.
+    let mut limited = routing_peer(
+        &mut node,
+        0,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+    );
+    let mut previous = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let mut alternate = routing_peer(&mut node, 2, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let request = InflightRequests::Blocks(hash);
+    let expired = Instant::now() - std::time::Duration::from_secs(121);
+    node.inflight.insert(request.clone(), (1, expired));
+    node.check_for_timeout().unwrap();
+    let actual = node.inflight.get(&request).unwrap().0;
+    let sent_to_previous = previous.try_recv().is_ok();
+    let sent_to_alternate =
+        matches!(alternate.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]);
+    let sent_to_limited = limited.try_recv().is_ok();
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+    eprintln!("body timeout route: previous={sent_to_previous}, alternate={sent_to_alternate}, limited={sent_to_limited}, inflight_owner={actual}");
+    assert!(
+        !sent_to_limited,
+        "limited peer must not receive a historical block"
+    );
+    assert_eq!(
+        actual, 2,
+        "body retry must first try another eligible full provider"
+    );
+    assert!(!sent_to_previous);
+    assert!(sent_to_alternate);
+}
+
+#[tokio::test]
+async fn body_timeout_preserves_lone_historical_provider_fallback() {
+    let (dir, mut node) = routing_node();
+    let hash = body_timeout_old_hash(&mut node);
+    let mut limited = routing_peer(
+        &mut node,
+        0,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+    );
+    let mut previous = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let request = InflightRequests::Blocks(hash);
+    let expired = Instant::now() - std::time::Duration::from_secs(121);
+    node.inflight.insert(request.clone(), (1, expired));
+    node.check_for_timeout().unwrap();
+    let (actual, retried_at) = *node.inflight.get(&request).unwrap();
+    let sent_to_previous =
+        matches!(previous.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]);
+    let sent_to_limited = limited.try_recv().is_ok();
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(
+        actual, 1,
+        "lone eligible full provider must remain retryable"
+    );
+    assert!(retried_at > expired);
+    assert!(sent_to_previous);
+    assert!(!sent_to_limited);
+}
+
+#[tokio::test]
+async fn body_timeout_does_not_fall_back_to_limited_only_peers() {
+    let (dir, mut node) = routing_node();
+    let hash = body_timeout_old_hash(&mut node);
+    let mut limited = routing_peer(
+        &mut node,
+        0,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+    );
+    let request = InflightRequests::Blocks(hash);
+    let expired = Instant::now() - std::time::Duration::from_secs(121);
+    node.inflight.insert(request.clone(), (1, expired));
+    let error = node.check_for_timeout().unwrap_err();
+    let retained = *node.inflight.get(&request).unwrap();
+    let sent_to_limited = limited.try_recv().is_ok();
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(matches!(
+        error,
+        crate::p2p_wire::error::WireError::NoPeersAvailable
+    ));
+    assert_eq!(
+        retained,
+        (1, expired),
+        "unavailable retry must retain the original inflight"
+    );
+    assert!(!sent_to_limited);
+}

@@ -141,6 +141,23 @@ where
         Ok(*peer_id)
     }
 
+    /// Prefer another full block provider after a timeout, while retaining a
+    /// lone provider as a fallback. Limited peers cannot supply arbitrary history.
+    pub(crate) fn send_block_body_request(
+        &self,
+        blocks: Vec<bitcoin::BlockHash>,
+        previous: Option<PeerId>,
+    ) -> Result<PeerId, WireError> {
+        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let eligible = |_: PeerId, peer: &LocalPeerView| peer.services.has(required);
+        let (peer_id, peer) = self
+            .choose_peer_by_latency(|id, peer| Some(id) != previous && eligible(id, peer))
+            .or_else(|| self.choose_peer_by_latency(eligible))
+            .ok_or(WireError::NoPeersAvailable)?;
+        peer.channel.send(NodeRequest::GetBlock(blocks))?;
+        Ok(*peer_id)
+    }
+
     /// BIP183 archives and full Utreexo nodes promise historical proofs. Recent
     /// providers may retain older proofs, so keep them as a fallback. Never
     /// send a block-body request to a proof-only peer or use it for tx relay.
@@ -733,7 +750,7 @@ where
             }
 
             InflightRequests::Blocks(block) => {
-                self.request_blocks(vec![*block])?;
+                self.request_blocks_from(vec![*block], Some(previous))?;
             }
 
             InflightRequests::Headers => {

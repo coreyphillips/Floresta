@@ -2,7 +2,6 @@
 
 use std::time::Instant;
 
-use bitcoin::p2p::ServiceFlags;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use floresta_chain::proof_util;
@@ -82,6 +81,14 @@ where
     WireError: From<Chain::Error>,
 {
     pub(crate) fn request_blocks(&mut self, blocks: Vec<BlockHash>) -> Result<(), WireError> {
+        self.request_blocks_from(blocks, None)
+    }
+
+    pub(crate) fn request_blocks_from(
+        &mut self,
+        blocks: Vec<BlockHash>,
+        previous: Option<PeerId>,
+    ) -> Result<(), WireError> {
         let should_request = |block: &BlockHash| {
             let is_inflight = self
                 .inflight
@@ -97,10 +104,7 @@ where
             return Ok(());
         }
 
-        let peer = self.send_to_fast_peer(
-            NodeRequest::GetBlock(blocks.clone()),
-            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-        )?;
+        let peer = self.send_block_body_request(blocks.clone(), previous)?;
 
         for block in blocks.iter() {
             self.inflight
