@@ -125,6 +125,7 @@ pub fn create_actors<R: AsyncRead + Unpin + Send>(
 pub struct Peer<T: AsyncWrite + Unpin + Send + Sync> {
     mempool: Arc<Mutex<Mempool>>,
     blocks_only: bool,
+    managed_relay: Option<crate::proven_tx::BoundRelay>,
     services: ServiceFlags,
     user_agent: String,
     messages: u64,
@@ -132,6 +133,7 @@ pub struct Peer<T: AsyncWrite + Unpin + Send + Sync> {
     last_message: Instant,
     last_addrv2: Instant,
     last_inv: Instant,
+    last_mempool: Option<(bitcoin::BlockHash, Instant)>,
     current_best_block: i32,
     last_ping: Option<Instant>,
     id: u32,
@@ -268,11 +270,18 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
 
     async fn peer_loop_inner(&mut self) -> Result<()> {
         // Send a `version` message to the peer.
-        let message_version = peer_utils::build_version_message(
+        let mut message_version = peer_utils::build_version_message(
             self.our_user_agent.clone(),
             self.our_best_block,
             &self.address,
         );
+        if let NetworkMessage::Version(version) = &mut message_version {
+            version.relay = self
+                .managed_relay
+                .as_ref()
+                .and_then(|bound| bound.permitted())
+                .is_some();
+        }
         self.write(message_version).await?;
         self.state = State::SentVersion(Instant::now());
         loop {
@@ -307,6 +316,38 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
 
             if self.shutdown {
                 return Ok(());
+            }
+
+            if self.state == State::Connected {
+                if let Some(id) = self.managed_relay.as_ref().and_then(|r| r.permitted())
+                    .and_then(|r| r.announcement(self.id)) {
+                    self.write(NetworkMessage::Inv(vec![Inventory::Transaction(id)])).await?;
+                }
+            }
+
+            // utreexod serves MEMPOOL only to filter-capable clients. A peer snapshot is
+            // bounded and has no completion marker. Refresh independent of wallet watches.
+            if self.state == State::Connected
+                && self.services.has(
+                    ServiceFlags::BLOOM
+                        | ServiceFlags::WITNESS
+                        | floresta_common::service_flags::UTREEXO.into(),
+                )
+            {
+                if let Some(tip) = self
+                    .managed_relay
+                    .as_ref()
+                    .and_then(|bound| bound.permitted())
+                    .and_then(|relay| relay.active_tip())
+                {
+                    let due = self.last_mempool.map_or(true, |(previous, time)| {
+                        previous != tip && time.elapsed() >= Duration::from_secs(60)
+                    });
+                    if due {
+                        self.write(NetworkMessage::MemPool).await?;
+                        self.last_mempool = Some((tip, Instant::now()));
+                    }
+                }
             }
 
             // If we send a ping and our peer doesn't respond in time, disconnect
@@ -446,6 +487,31 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
         match self.state {
             State::Connected => match message {
                 NetworkMessage::Inv(inv) => {
+                    if let Some(relay) = self
+                        .managed_relay
+                        .as_ref()
+                        .and_then(|bound| bound.permitted())
+                    {
+                        let required =
+                            ServiceFlags::WITNESS | floresta_common::service_flags::UTREEXO.into();
+                        if self.services.has(required) {
+                            let requests = relay.requests(self.id, &inv);
+                            if !requests.is_empty() {
+                                self.write(NetworkMessage::GetData(requests)).await?;
+                            }
+                        }
+                        // A transaction-only announcement must not consume the block INV throttle.
+                        if !inv.iter().any(|i| {
+                            matches!(
+                                i,
+                                Inventory::Block(_)
+                                    | Inventory::WitnessBlock(_)
+                                    | Inventory::CompactBlock(_)
+                            )
+                        }) {
+                            return Ok(());
+                        }
+                    }
                     let mut block_inv_elements = 0;
 
                     // Silently drop
@@ -539,6 +605,21 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     self.last_ping = None;
                 }
                 NetworkMessage::Unknown { command, payload } => {
+                    if command.as_ref() == "utreexotx" {
+                        if let Some(relay) = self
+                            .managed_relay
+                            .as_ref()
+                            .and_then(|bound| bound.permitted())
+                        {
+                            // A stale or unsolicited transaction has no local or network effects.
+                            if let crate::proven_tx::Intake::Request(request) =
+                                relay.receive(self.id, &payload)
+                            {
+                                self.write(NetworkMessage::GetData(request)).await?;
+                            }
+                        }
+                        return Ok(());
+                    }
                     let utreexo_proof_cmd =
                         CommandString::try_from_static(UTREEXO_PROOF_CMD_STRING)
                             .expect("Invalid command string");
@@ -644,6 +725,14 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     }
 
     pub async fn handle_get_data(&mut self, inv: Inventory) -> Result<()> {
+        if let Inventory::Transaction(id) | Inventory::WitnessTransaction(id) = inv {
+            if let Some((tx, sent)) = self.managed_relay.as_ref().and_then(|r| r.permitted())
+                .and_then(|r| r.fulfill(self.id, id)) {
+                self.write(NetworkMessage::Tx(tx)).await?;
+                let _ = sent.try_send(());
+                return Ok(());
+            }
+        }
         match inv {
             Inventory::WitnessTransaction(txid) => {
                 let tx = self.mempool.lock().await.get_from_mempool(&txid).cloned();
@@ -676,15 +765,18 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
         our_best_block: u32,
         cancellation_sender: tokio::sync::oneshot::Sender<()>,
         transport_protocol: TransportProtocol,
+        managed_relay: Option<crate::proven_tx::BoundRelay>,
     ) {
         let peer = Peer {
             address,
             blocks_only: false,
+            managed_relay,
             current_best_block: -1,
             id,
             mempool,
             last_ping: None,
             last_message: Instant::now(),
+            last_mempool: None,
             last_inv: Instant::now() - INV_MESSAGE_INTERVAL,
             last_addrv2: Instant::now() - ADDRV2_MESSAGE_INTERVAL,
             node_tx,
@@ -945,8 +1037,10 @@ mod tests {
             user_agent: "/Mock-Peer:0.0.0/".into(),
             start_time: Instant::now(),
             blocks_only: true,
+            managed_relay: None,
             last_addrv2: Instant::now(),
             last_message: Instant::now(),
+            last_mempool: None,
             last_inv: Instant::now(),
             send_headers: true,
             wants_addrv2: true,

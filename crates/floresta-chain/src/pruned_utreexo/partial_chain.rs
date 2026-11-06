@@ -59,7 +59,7 @@ pub(crate) struct PartialChainStateInner {
     pub(crate) final_height: u32,
     /// The error that occurred during validation, if any. It is here so we can
     /// pull that afterwards.
-    pub(crate) error: Option<BlockValidationErrors>,
+    pub(crate) error: Option<String>,
     /// The consensus parameters, we need this to validate the blocks.
     pub(crate) consensus: Consensus,
     /// Whether we assume the signatures in this interval as valid, this is used to
@@ -139,16 +139,15 @@ impl PartialChainStateInner {
     ) -> Result<u32, BlockchainError> {
         let height = self.current_height + 1;
 
-        if let Err(BlockchainError::BlockValidation(e)) = self.validate_block(block, height, inputs)
-        {
-            self.error = Some(e.clone());
-            return Err(BlockchainError::BlockValidation(e));
+        if let Err(error) = self.validate_block(block, height, inputs) {
+            self.error = Some(error.to_string());
+            return Err(error);
         }
 
         let acc = match Consensus::update_acc(&self.current_acc, block, height, proof, del_hashes) {
             Ok(acc) => acc,
             Err(_) => {
-                self.error = Some(BlockValidationErrors::InvalidProof);
+                self.error = Some(BlockValidationErrors::InvalidProof.to_string());
                 return Err(BlockchainError::InvalidProof);
             }
         };
@@ -177,13 +176,15 @@ impl PartialChainStateInner {
         self.consensus.check_block(block, height)?;
 
         let prev_block = self.get_ancestor(height)?;
-        if block.header.prev_blockhash != prev_block.block_hash() {
+        if block.header.prev_blockhash != prev_block.block_hash()
+            || self.get_block(height).map(BlockHeader::block_hash) != Some(block.block_hash())
+        {
             return Err(BlockValidationErrors::BlockExtendsAnOrphanChain)?;
         }
 
         // Validate block transactions
         let subsidy = self.consensus.get_subsidy(height);
-        let verify_script = self.assume_valid;
+        let verify_script = !self.assume_valid;
 
         #[cfg(feature = "bitcoinkernel")]
         let flags = self
@@ -247,7 +248,7 @@ impl PartialChainState {
         self.inner()
             .blocks
             .iter()
-            .take(self.inner().current_height as usize)
+            .take(self.inner().current_height as usize + 1)
             .collect()
     }
 
@@ -278,6 +279,10 @@ impl UpdatableChainstate for PartialChainState {
     }
 
     //these are no-ops, you can call them, but they won't do anything
+
+    fn replay_failure(&self) -> Option<String> {
+        self.inner().error.clone()
+    }
 
     fn flush(&self) -> Result<(), BlockchainError> {
         // no-op: we keep everything on memory
@@ -518,6 +523,63 @@ mod tests {
             error: None,
         }
         .into()
+    }
+
+    #[cfg(feature = "bitcoinkernel")]
+    #[test]
+    fn managed_replay_rejects_invalid_input_script_without_advancing() {
+        use crate::pruned_utreexo::utxo_data::UtxoData;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid};
+
+        let mut blocks = include_str!("../../testdata/blocks.txt")
+            .lines()
+            .map(parse_block);
+        let genesis = blocks.next().unwrap();
+        let mut block = blocks.next().unwrap();
+        let outpoint = OutPoint::new(Txid::all_zeros(), 0);
+        let input = TxIn {
+            previous_output: outpoint,
+            ..Default::default()
+        };
+        let output = TxOut {
+            value: Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::new(),
+        };
+        block.txdata.push(Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![input],
+            output: vec![output.clone()],
+        });
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let mut spent = output;
+        spent.script_pubkey = ScriptBuf::from_bytes(vec![0xac]); // OP_CHECKSIG with no signature or public key
+        let inputs = HashMap::from([(
+            outpoint,
+            UtxoData {
+                txout: spent,
+                is_coinbase: false,
+                creation_height: 0,
+                creation_time: 0,
+            },
+        )]);
+        let chain = get_empty_pchain(vec![genesis.header, block.header]);
+        chain
+            .inner()
+            .validate_block(&block, 1, inputs.clone())
+            .unwrap(); // assume signatures in the control
+        chain.inner_mut().assume_valid = false;
+        let error = chain
+            .connect_block(&block, Proof::default(), inputs, vec![])
+            .unwrap_err();
+        assert!(
+            matches!(error, BlockchainError::TransactionError(ref tx) if matches!(tx.error, BlockValidationErrors::ScriptValidationError(_))),
+            "{error:?}"
+        );
+        assert_eq!(chain.inner().current_height, 0);
+        assert_eq!(chain.inner().current_acc, Stump::default());
+        assert!(chain.has_invalid_blocks());
     }
 
     #[test]

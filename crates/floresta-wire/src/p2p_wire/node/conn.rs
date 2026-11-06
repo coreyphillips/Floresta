@@ -84,21 +84,17 @@ where
             _ => ServiceFlags::NONE,
         };
 
-        // Get the fixed peer's `peer_id` and `LocalAddress` if set,
-        // or fetch a new address from the address manager.
-        let candidate_peer = self
-            .fixed_peer
-            .as_ref()
-            .map(|addr| (0, addr.clone()))
-            .or_else(|| {
-                self.address_man.get_address_to_connect(
+        let candidate_peer = self.fixed_peer.clone().or_else(|| {
+            self.address_man
+                .get_address_to_connect(
                     required_services,
                     matches!(conn_kind, ConnectionKind::Feeler),
                 )
-            });
+                .map(|(_, address)| address)
+        });
 
         // Load hardcoded addresses to the address manager if no fixed or manual peers exist.
-        let Some((peer_id, peer_address)) = candidate_peer else {
+        let Some(peer_address) = candidate_peer else {
             if !matches!(conn_kind, ConnectionKind::Manual) {
                 let net = self.network;
                 self.address_man.add_fixed_addresses(net);
@@ -108,34 +104,13 @@ where
 
         debug!("Attempting connection with address={peer_address:?} kind={conn_kind:?}",);
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Defaults to failed, if the connection is successful, we'll update the state
-        self.address_man
-            .update_set_state(peer_id, AddressState::Failed(now));
-
-        // Don't open duplicate connections to the same peer.
-        let is_peer_connected = |(_, old_peer): (_, &LocalPeerView)| {
-            peer_address.get_net_address() == old_peer.address
-                && peer_address.get_port() == old_peer.port
-        };
-        if self.peers.iter().any(is_peer_connected) {
-            return Err(WireError::PeerAlreadyExists(
-                peer_address.get_net_address(),
-                peer_address.get_port(),
-            ));
-        }
-
         // Only allow P2PV1 fallback if the peer's connection kind is manual,
         // or if the `--allow-v1-fallback` CLI argument was set.
         let allow_v1_fallback =
             matches!(conn_kind, ConnectionKind::Manual) || self.config.allow_v1_fallback;
 
         // Open a connection to the peer.
-        self.open_connection(conn_kind, peer_id, peer_address, allow_v1_fallback)?;
+        self.open_connection(conn_kind, peer_address, allow_v1_fallback)?;
 
         Ok(())
     }
@@ -153,6 +128,40 @@ where
         Ok(())
     }
 
+    // Gossip contributes at most one endpoint per host. A local second endpoint may fill a
+    // missing proof service without replacing the healthy connection or claiming another vote.
+    fn can_open_endpoint(&self, kind: ConnectionKind, endpoint: &LocalAddress) -> bool {
+        let mut siblings = self
+            .peers
+            .values()
+            .filter(|p| p.address == endpoint.get_net_address());
+        let Some(first) = siblings.next() else {
+            return true;
+        };
+        if kind == ConnectionKind::Manual {
+            return first.port != endpoint.get_port()
+                && siblings.all(|p| p.port != endpoint.get_port());
+        }
+        let ConnectionKind::Regular(service) = kind else {
+            return false;
+        };
+        if siblings.next().is_some()
+            || first.state != PeerStatus::Ready
+            || first.port == endpoint.get_port()
+            || !endpoint.get_services().has(service)
+            || first.services.has(service)
+        {
+            return false;
+        }
+        let proof = service_flags::UTREEXO.into();
+        let archive = service_flags::UTREEXO_ARCHIVE.into();
+        service == proof
+            || service == archive
+            || (service == ServiceFlags::NETWORK
+                && !first.serves_block_bodies()
+                && (first.services.has(proof) || first.services.has(archive)))
+    }
+
     /// Creates a new outgoing connection with `address`.
     ///
     /// `kind` may or may not be a [`ConnectionKind::Feeler`], a special connection type
@@ -167,10 +176,28 @@ where
     pub(crate) fn open_connection(
         &mut self,
         kind: ConnectionKind,
-        peer_id: usize,
         peer_address: LocalAddress,
         allow_v1_fallback: bool,
     ) -> Result<(), WireError> {
+        if self
+            .address_man
+            .banned_until(&peer_address.get_addrv2())
+            .is_some()
+        {
+            return Err(WireError::PeerMisbehaving);
+        }
+        if !self.can_open_endpoint(kind, &peer_address) {
+            return Err(WireError::PeerAlreadyExists(
+                peer_address.get_net_address(),
+                peer_address.get_port(),
+            ));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.address_man
+            .update_set_state(peer_address.id, AddressState::Failed(now));
         let (requests_tx, requests_rx) = unbounded_channel();
         if let Some(ref proxy) = self.socks5 {
             spawn(timeout(
@@ -209,6 +236,7 @@ where
                         .expect("infallible in ChainState")
                         .0,
                     allow_v1_fallback,
+                    self.config.managed_relay.clone(),
                 ),
             ));
         }
@@ -232,7 +260,7 @@ where
                 services: ServiceFlags::NONE,
                 _last_message: Instant::now(),
                 kind,
-                address_id: peer_id as u32,
+                address_id: peer_address.id,
                 height: 0,
                 banscore: 0,
                 // Will be downgraded to V1 if the V2 handshake fails, and we allow fallback
@@ -272,8 +300,9 @@ where
         our_user_agent: String,
         our_best_block: u32,
         allow_v1_fallback: bool,
+        managed_relay: Option<crate::proven_tx::Relay>,
     ) -> Result<(), WireError> {
-        let (transport_reader, transport_writer, transport_protocol) = transport::connect(
+        let (transport_reader, transport_writer, transport_protocol, actual) = transport::connect(
             (peer_address.get_net_address(), peer_address.get_port()),
             network,
             allow_v1_fallback,
@@ -303,6 +332,7 @@ where
             our_best_block,
             cancellation_sender,
             transport_protocol,
+            managed_relay.and_then(|relay| relay.bind(network, actual)),
         );
 
         Ok(())
@@ -349,6 +379,7 @@ where
             our_best_block,
             cancellation_sender,
             transport_protocol,
+            None,
         );
         Ok(())
     }
@@ -498,21 +529,25 @@ where
             let default_port = Self::get_port(network);
             let dns_seeds = floresta_chain::get_chain_dns_seeds(network);
 
-            let mut addresses = Vec::new();
+            // Publish each seed promptly so a slow unrelated resolver cannot hold
+            // an already resolved proof source until the entire seed list finishes.
             for seed in &dns_seeds {
-                if let Ok(got) = AddressMan::get_seeds_from_dns(seed, default_port, proxy_addr) {
-                    addresses.extend(got);
+                if let Ok(addresses) =
+                    AddressMan::get_seeds_from_dns(seed, default_port, proxy_addr)
+                {
+                    info!(
+                        "Fetched {} peer addresses from DNS seed {}",
+                        addresses.len(),
+                        seed.seed
+                    );
+                    if node_sender
+                        .send(NodeNotification::DnsSeedAddresses(addresses))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
-
-            info!(
-                "Fetched {} peer addresses from all DNS seeds",
-                addresses.len()
-            );
-
-            node_sender
-                .send(NodeNotification::DnsSeedAddresses(addresses))
-                .unwrap();
         });
 
         Ok(())
@@ -521,13 +556,23 @@ where
     /// Check whether it's necessary to request more addresses from DNS seeds.
     ///
     /// Perform another address request from DNS seeds if we still don't have enough addresses
-    /// on the [`AddressMan`] and the last address request from DNS seeds was over 2 minutes ago.
+    /// on the [`AddressMan`] or a connected historical proof provider, subject to the
+    /// existing hourly DNS request interval.
     fn maybe_ask_dns_seed_for_addresses(&mut self) {
         let enough_addresses = self.address_man.enough_addresses();
 
-        // Skip if address fetching from DNS seeds is disabled,
-        // or if the [`AddressMan`] has enough addresses in its database.
-        if self.config.disable_dns_seeds || enough_addresses {
+        // Address hints do not establish a live provider of historical proofs.
+        // Retry even with a full address book while historical synchronization
+        // lacks the required service. The existing interval bounds DNS traffic.
+        let historical_gap = self
+            .chain
+            .get_best_block()
+            .map(|best| best.0)
+            .unwrap_or_default()
+            .saturating_sub(self.chain.get_validation_index().unwrap_or_default());
+        let needs_archive =
+            (self.historical_replay || historical_gap >= 288) && !self.has_historical_proof_peer();
+        if self.config.disable_dns_seeds || (enough_addresses && !needs_archive) {
             return;
         }
 
@@ -584,13 +629,18 @@ where
         }
 
         for address in anchors {
-            self.open_connection(
-                ConnectionKind::Regular(service_flags::UTREEXO.into()),
-                address.id,
+            let address = self.address_man.remember_local_endpoint(address);
+            let service = if address.get_services().has(service_flags::UTREEXO_ARCHIVE.into()) {
+                service_flags::UTREEXO_ARCHIVE.into()
+            } else {
+                service_flags::UTREEXO.into()
+            };
+            // A restored sibling, duplicate or banned anchor must not prevent trying the rest.
+            try_and_log!(self.open_connection(
+                ConnectionKind::Regular(service),
                 address,
-                // Using V1 transport fallback as utreexo nodes have limited support
                 true,
-            )?;
+            ));
         }
 
         Ok(())
@@ -636,34 +686,14 @@ where
         if self.added_peers.is_empty() {
             return Ok(());
         }
-        let peers_count = self.peer_id_count;
-        for added_peer in self.added_peers.clone() {
-            let matching_peer = self.peers.values().find(|peer| {
-                self.to_addr_v2(peer.address) == added_peer.address && peer.port == added_peer.port
-            });
-
-            if matching_peer.is_none() {
-                let address = LocalAddress::new(
-                    added_peer.address.clone(),
-                    0,
-                    AddressState::Tried(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    ),
-                    ServiceFlags::NONE,
-                    added_peer.port,
-                    peers_count as usize,
-                );
-
-                // Finally, open the connection with the node
-                self.open_connection(
-                    ConnectionKind::Manual,
-                    peers_count as usize,
-                    address,
-                    added_peer.v1_fallback,
-                )?
+        for added in self.added_peers.clone() {
+            if self.can_open_endpoint(ConnectionKind::Manual, &added.endpoint)
+                && self
+                    .address_man
+                    .banned_until(&added.endpoint.get_addrv2())
+                    .is_none()
+            {
+                self.open_connection(ConnectionKind::Manual, added.endpoint, added.v1_fallback)?;
             }
         }
         Ok(())

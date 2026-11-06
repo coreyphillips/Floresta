@@ -146,17 +146,34 @@ where
         // retry the added peers connections
         self.maybe_open_connection_with_added_peers()?;
 
-        // if we have 10 connections, but not a single utreexo or CBF one, disconnect one random
-        // peer and create a utreexo and CBS connection
-        if !self.has_utreexo_peers() {
-            if self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
+        // Historical wallet scans can still need proofs far behind the active tip.
+        let need_archive = !self.has_historical_proof_peer();
+        let need_recent = !self.has_utreexo_peers();
+        if (need_archive || need_recent)
+            && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS
+        {
+            let count = |test: fn(&super::LocalPeerView) -> bool| {
                 self.peers
                     .values()
-                    .filter(|peer| peer.is_regular_peer())
-                    .choose(&mut thread_rng())
-                    .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
-            }
-
+                    .filter(|p| p.state == super::PeerStatus::Ready && test(p))
+                    .count()
+            };
+            let body_peers = count(super::LocalPeerView::serves_block_bodies);
+            let proof_peers = count(super::LocalPeerView::serves_block_proofs);
+            self.peers
+                .values()
+                .filter(|p| {
+                    p.is_regular_peer()
+                        && (!p.serves_block_proofs() || (need_archive && proof_peers > 1))
+                        && (!p.serves_block_bodies() || body_peers > 1)
+                })
+                .choose(&mut thread_rng())
+                .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
+        }
+        if need_archive {
+            self.maybe_open_connection(service_flags::UTREEXO_ARCHIVE.into())?;
+        }
+        if need_recent {
             self.maybe_open_connection(service_flags::UTREEXO.into())?;
         }
 
@@ -179,6 +196,139 @@ where
         self.maybe_open_connection(ServiceFlags::NONE)?;
 
         Ok(())
+    }
+
+    /// Reconstruct the managed network anchor from genesis and execute historical scripts.
+    /// The full foreground validator continues above this boundary.
+    fn managed_backfill(
+        &self,
+        status: crate::Historical,
+        done: std::sync::mpsc::Sender<()>,
+        fresh_chain: bool,
+    ) -> Result<bool, WireError> {
+        use crate::p2p_wire::historical::{Admission, Checkpoint, Fence};
+        use floresta_chain::ChainParams;
+        use std::io;
+        use std::path::Path;
+
+        let mut anchor = ChainParams::get_assume_utreexo(self.config.network);
+        if anchor.height == 0 {
+            // No assumed interval on this network. On restart independently replay any
+            // already persisted prefix under the current verification policy.
+            let height = self.chain.get_validation_index()?;
+            let stump = self.chain.get_acc();
+            anchor.height = height;
+            anchor.block_hash = self.chain.get_block_hash(height)?;
+            anchor.leaves = stump.leaves;
+            anchor.roots = stump.roots;
+        }
+        if self.chain.get_block_hash(anchor.height)? != anchor.block_hash {
+            return Err(io::Error::other(
+                "Selected chain does not include the pinned historical anchor",
+            )
+            .into());
+        }
+
+        let checkpoint = Checkpoint::open(
+            Path::new(&self.config.datadir),
+            self.config.network,
+            anchor.clone(),
+        )?;
+        let recovered = checkpoint.recover(|at| self.chain.get_block_hash(at).ok());
+        let admission = checkpoint.reserve(
+            fresh_chain,
+            recovered.is_ok(),
+            matches!(&recovered, Ok((_, _, true))),
+        )?;
+        let (mut height, mut stump, mut complete) = recovered.unwrap_or_else(|error| {
+            warn!("Restarting historical validation from genesis: {error}");
+            (0, Stump::default(), false)
+        });
+        // A previous partial replay is still authenticated work. Never retire a
+        // fence merely by reloading an old complete record at the target.
+        if admission.requires_replay() && height >= anchor.height {
+            height = 0;
+            stump = Stump::default();
+            complete = false;
+        }
+        status.begin(height, &anchor, admission);
+        if complete || anchor.height == 0 {
+            if anchor.height == 0 && !checkpoint.matches(&Stump::default()) {
+                return Err(io::Error::other("Genesis accumulator mismatch").into());
+            }
+            status.verified();
+            return Ok(false);
+        }
+
+        let chain = self.chain.get_partial_chain(height, anchor.height, stump)?;
+        let mut replay_config = self.config.clone();
+        replay_config.managed_relay = None;
+        let mut node = UtreexoNode::<PartialChainState, SyncNode>::new(
+            replay_config,
+            chain,
+            self.mempool.clone(),
+            None,
+            self.kill_signal.clone(),
+            self.address_man.clone_for_new_node(),
+        )?;
+        node.historical_replay = true;
+        node.context.replay = Some((checkpoint.clone(), status.clone(), height));
+        let outer = self.chain.clone();
+        let progress = status.clone();
+        let worker = tokio::spawn(async move {
+            let node = node.run(|_| {}).await;
+            let chain = &node.chain;
+            if let Some(error) = chain.replay_failure() {
+                return Err(io::Error::other(error));
+            }
+            if progress.failed() {
+                return Ok(());
+            }
+            let height = chain.get_validation_index().map_err(io::Error::other)?;
+            progress.advance(height);
+            let hash = chain.get_block_hash(height).map_err(io::Error::other)?;
+            let stump = chain.get_acc();
+            if height < anchor.height {
+                checkpoint.store(height, hash, &stump, false)?;
+                if admission == Admission::Reserved
+                    && *node.kill_signal.read().await
+                    && outer.get_block_hash(anchor.height).ok() == Some(anchor.block_hash)
+                {
+                    checkpoint.fence(Fence::Ready)?;
+                }
+                return Ok(());
+            }
+            checkpoint.check_replayed_anchor(
+                height,
+                hash,
+                outer.get_block_hash(height).ok(),
+                &stump,
+            )?;
+            for block in chain.list_valid_blocks() {
+                outer
+                    .mark_block_as_valid(block.block_hash())
+                    .map_err(io::Error::other)?;
+            }
+            outer.flush().map_err(io::Error::other)?;
+            if outer.get_block_hash(height).ok() != Some(hash) {
+                return Err(io::Error::other(
+                    "Historical anchor changed while publishing verification",
+                ));
+            }
+            checkpoint.store(height, hash, &stump, true)?;
+            checkpoint.fence(Fence::Ready)?;
+            progress.verified();
+            Ok::<_, io::Error>(())
+        });
+        tokio::spawn(async move {
+            match worker.await {
+                Err(_) => status.fail("Historical verification worker exited unexpectedly"),
+                Ok(Err(error)) => status.fail(&error.to_string()),
+                Ok(Ok(())) => {}
+            }
+            let _ = done.send(());
+        });
+        Ok(true)
     }
 
     /// If either PoW fraud proofs or assumeutreexo are enabled, we will "skip" IBD for all
@@ -233,19 +383,20 @@ where
             }
         };
 
-        let backfill = UtreexoNode::<PartialChainState, SyncNode>::new(
+        let mut backfill = UtreexoNode::<PartialChainState, SyncNode>::new(
             self.config.clone(),
             chain,
             self.mempool.clone(),
             None,
             self.kill_signal.clone(),
-            self.address_man.clone(),
+            self.address_man.clone_for_new_node(),
         )
         .unwrap();
 
         let datadir = self.config.datadir.clone();
         let outer_chain = self.chain.clone();
 
+        backfill.historical_replay = true;
         let fut = UtreexoNode::<PartialChainState, SyncNode>::run(
             backfill,
             move |chain: &PartialChainState| {
@@ -287,6 +438,16 @@ where
     }
 
     pub async fn run(mut self, stop_signal: tokio::sync::oneshot::Sender<()>) {
+        // Capture freshness before examining any peer headers. Losing a fence file
+        // in an established store never creates a fresh fast-start permission.
+        let fresh_chain = self.config.historical.is_some()
+            && self.config.network == bitcoin::Network::Bitcoin
+            && self.chain.get_validation_index().ok() == Some(0)
+            && self.chain.get_best_block().ok()
+                == Some((
+                    0,
+                    bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).block_hash(),
+                ));
         try_and_warn!(self.init_peers());
 
         // Use this node state to Initial Block download
@@ -303,7 +464,7 @@ where
         };
 
         if *self.kill_signal.read().await {
-            self.shutdown();
+            try_and_log!(self.shutdown());
             try_and_log!(stop_signal.send(()));
             return;
         }
@@ -314,8 +475,17 @@ where
         let is_backfilling = match self.config.backfill {
             true => {
                 info!("Starting backfill task...");
-                self.backfill(sender)
-                    .expect("Failed to spawn backfill thread")
+                match self.config.historical.clone() {
+                    Some(status) => self
+                        .managed_backfill(status.clone(), sender, fresh_chain)
+                        .unwrap_or_else(|error| {
+                            status.fail(&error.to_string());
+                            false
+                        }),
+                    None => self
+                        .backfill(sender)
+                        .expect("Failed to spawn backfill thread"),
+                }
             }
             false => false,
         };
@@ -331,7 +501,10 @@ where
         };
 
         if *self.kill_signal.read().await {
-            self.shutdown();
+            if is_backfilling {
+                let _ = tokio::task::spawn_blocking(move || recv.recv()).await;
+            }
+            try_and_log!(self.shutdown());
             stop_signal.send(()).unwrap();
             return;
         }
@@ -385,11 +558,58 @@ where
         // ignore the error here because if the backfill task already
         // finished, this channel will be closed
         if is_backfilling {
-            let _ = recv.recv();
+            let _ = tokio::task::spawn_blocking(move || recv.recv()).await;
         }
 
-        self.shutdown();
+        match self.shutdown() {
+            Ok(()) => try_and_warn!(self.seal_managed_prefix()),
+            Err(error) => warn!("Could not flush the chain store: {error}"),
+        }
         let _ = stop_signal.send(());
+    }
+
+    /// Called after the main writer has stopped, replay has joined and the chain store
+    /// has flushed. A crash before this point leaves the previous valid checkpoint.
+    fn seal_managed_prefix(&self) -> Result<(), WireError> {
+        use crate::p2p_wire::historical::Checkpoint;
+        use floresta_chain::{AssumeUtreexoValue, ChainParams};
+        use std::path::Path;
+
+        let Some(ancestor) = self
+            .config
+            .historical
+            .as_ref()
+            .and_then(|h| h.completed_anchor())
+        else {
+            return Ok(());
+        };
+        let network = self.config.network;
+        let pin = ChainParams::get_assume_utreexo(network);
+        if pin.height != 0
+            || !self.config.backfill
+            || self.config.pow_fraud_proofs
+            || !self.config.assume_utreexo.as_ref().is_some_and(|a| {
+                a.height == 0
+                    && a.leaves == 0
+                    && a.roots.is_empty()
+                    && a.block_hash == pin.block_hash
+            })
+            || self.chain.get_block_hash(0)? != pin.block_hash
+        {
+            return Ok(());
+        }
+        let Some((height, block_hash, stump)) = self.chain.verified_descendant(ancestor)? else {
+            return Ok(());
+        };
+        let target = AssumeUtreexoValue {
+            height,
+            block_hash,
+            leaves: stump.leaves,
+            roots: stump.roots.clone(),
+        };
+        Checkpoint::open(Path::new(&self.config.datadir), network, target)?
+            .store(height, block_hash, &stump, true)?;
+        Ok(())
     }
 
     /// Performs the periodic maintenance tasks, including checking for the cancel signal, peer
@@ -403,6 +623,13 @@ where
 
         // Jobs that don't need a connected peer
         try_and_log!(self.process_pending_blocks());
+        if let Some(relay) = &self.config.managed_relay {
+            let current = self.chain.get_best_block().ok().and_then(|(height, hash)| {
+                (!self.chain.is_in_ibd() && self.chain.get_validation_index().ok() == Some(height))
+                    .then(|| (height, hash, self.chain.get_acc().leaves))
+            });
+            relay.tip(current);
+        }
 
         // Save our peers db
         periodic_job!(
@@ -462,7 +689,7 @@ where
         try_and_log!(self.ask_missed_block());
 
         // requests that need a utreexo peer
-        if !self.has_utreexo_peers() {
+        if !self.has_block_proof_peers() {
             return LoopControl::Continue;
         }
 
@@ -751,15 +978,15 @@ where
 
                             self.chain.accept_header(*header)?;
 
-                            self.send_to_peer(
-                                peer,
-                                NodeRequest::GetBlock(vec![header.block_hash()]),
-                            )?;
-
-                            self.inflight.insert(
-                                InflightRequests::Blocks(header.block_hash()),
-                                (peer, Instant::now()),
-                            );
+                            // A proof bridge can announce headers but cannot supply their blocks.
+                            if self.peers.get(&peer).is_some_and(|p| p.serves_block_bodies()) {
+                                self.send_to_peer(peer, NodeRequest::GetBlock(vec![block_hash]))?;
+                                self.inflight.insert(
+                                    InflightRequests::Blocks(block_hash), (peer, Instant::now()),
+                                );
+                            } else {
+                                self.request_blocks(vec![block_hash])?;
+                            }
                         }
                    }
 

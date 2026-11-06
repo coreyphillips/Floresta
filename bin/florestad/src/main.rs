@@ -19,6 +19,9 @@
 mod cli;
 #[cfg(unix)]
 mod daemonize;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod managed_cleanup;
+mod managed_owner;
 
 use std::env;
 use std::fs;
@@ -54,7 +57,26 @@ fn main() {
     params.validate();
 
     // If not provided defaults to `$HOME/.floresta`. Uses a subdirectory for non-mainnet networks.
-    let data_dir = data_dir_path(params.data_dir, params.network);
+    let data_dir = data_dir_path(params.data_dir.clone(), params.network);
+    if let Some(owner) = params.managed_cleanup_for {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if managed_cleanup::remove(
+            params.data_dir.as_deref().unwrap(),
+            &data_dir,
+            params.network,
+            &owner,
+            params.managed_next_owner.as_deref(),
+        )
+        .is_ok()
+        {
+            println!("chicory.storage-removed/1");
+            return;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = owner;
+        eprintln!("Managed storage cleanup could not safely finish.");
+        exit(1);
+    }
 
     // Create the data directory if it doesn't exist
     fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
@@ -62,7 +84,59 @@ fn main() {
         exit(1);
     });
 
+    // Managed control never binds a TCP socket. Refuse a build with auxiliary listeners.
+    let managed = params.managed_stdio;
+    if managed
+        && (!cfg!(feature = "compact-filters")
+            || cfg!(any(
+                feature = "json-rpc",
+                feature = "metrics",
+                feature = "zmq-server",
+                feature = "tokio-console"
+            )))
+    {
+        eprintln!("Managed mode requires a compact-filters build without public control services.");
+        exit(1);
+    }
+    // Hold the kernel lock in the daemon. A parent crash cannot release a live child's
+    // store and a dead process leaves no stale PID to trust or remove.
+    let _managed_lock = managed.then(|| {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(&data_dir).join("chicory-managed.lock"))
+            .unwrap_or_else(|_| {
+                eprintln!("Could not open the managed data lock.");
+                exit(1)
+            });
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap_or_else(|_| {
+            eprintln!("Managed data directory is already in use.");
+            exit(73)
+        });
+        lock
+    });
+
+    if managed {
+        let root = std::path::Path::new(params.data_dir.as_deref().unwrap());
+        if managed_owner::check(root, params.network, params.managed_store_owner.as_deref())
+            .is_err()
+        {
+            eprintln!(
+                "Managed store owner or build differs. Rebuild or reconnect the original storage."
+            );
+            exit(1);
+        }
+        let marker = PathBuf::from(&data_dir).join("chicory-removal-pending");
+        if !matches!(fs::symlink_metadata(marker), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+            eprintln!("Finish removing managed storage before restarting this node.");
+            exit(1);
+        }
+    }
+
     let config = Config {
+        managed_stdio: managed,
         data_dir,
         disable_dns_seeds: params.connect.is_some() || params.disable_dns_seeds,
         network: params.network,
@@ -74,9 +148,9 @@ fn main() {
         wallet_xpub: params.wallet_xpub,
         config_file: params.config_file,
         #[cfg(unix)]
-        log_to_stdout: !params.daemon,
+        log_to_stdout: !params.daemon && !managed,
         #[cfg(not(unix))]
-        log_to_stdout: true,
+        log_to_stdout: !managed,
         #[cfg(unix)]
         log_to_file: params.log_to_file || params.daemon,
         #[cfg(not(unix))]
@@ -91,7 +165,11 @@ fn main() {
         filters_start_height: params.filters_start_height,
         user_agent: env!("USER_AGENT").to_owned(),
         assumeutreexo_value: None,
-        electrum_address: params.electrum_address,
+        electrum_address: if managed {
+            Some("127.0.0.1:0".into())
+        } else {
+            params.electrum_address
+        },
         enable_electrum_tls: params.enable_electrum_tls,
         electrum_address_tls: params.electrum_address_tls,
         tls_cert_path: params.tls_cert_path,
@@ -133,7 +211,6 @@ fn main() {
 
     let signal = Arc::new(RwLock::new(false));
     let _signal = signal.clone();
-
     _rt.spawn(async move {
         // This is used to signal the runtime to stop gracefully.
         // It will be set to true when we receive a Ctrl-C or a stop signal.
@@ -158,7 +235,12 @@ fn main() {
                 break;
             }
 
-            sleep(Duration::from_secs(5)).await;
+            sleep(if managed {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_secs(5)
+            })
+            .await;
         }
     });
 

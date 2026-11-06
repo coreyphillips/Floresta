@@ -83,6 +83,10 @@ pub struct DnsSeed {
 
     /// Useful filters we can use to find relevant peers
     pub filters: ServiceFlags,
+
+    /// Candidate service hints for a seed queried without a filter prefix.
+    /// The peer's version handshake determines its actual services.
+    pub unfiltered_services: ServiceFlags,
 }
 
 /// This functionality is used to create a new DNS seed with possible filters.
@@ -93,7 +97,14 @@ impl DnsSeed {
             network,
             seed,
             filters,
+            unfiltered_services: ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
         }
+    }
+
+    /// Set the services to probe among an unfiltered seed's candidates.
+    pub fn with_unfiltered_services(mut self, services: ServiceFlags) -> Self {
+        self.unfiltered_services = services;
+        self
     }
 }
 
@@ -391,6 +402,11 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
     #[rustfmt::skip]
     match network {
         Network::Bitcoin => {
+            // Utreexod's bare seed supplies proof candidates. Probe for archival
+            // support, then replace these hints with the version handshake flags.
+            seeds.push(DnsSeed::new(Network::Bitcoin, "manualseed.calvinkim.info", none)
+                .with_unfiltered_services(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | service_flags::UTREEXO.into() | service_flags::UTREEXO_ARCHIVE.into()));
+            seeds.push(DnsSeed::new(Network::Bitcoin, "bitcoin.seed.dlsouza.lol", service_flags::UTREEXO.into()));
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.calvinkim.info", x1009));
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.luisschwab.com", x1009));
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.sipa.be", x9));

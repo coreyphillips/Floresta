@@ -5,6 +5,9 @@ use core::fmt::Debug;
 use core::fmt::Display;
 use core::fmt::Formatter;
 use std::io;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 
 use bip324::futures::Protocol;
 use bip324::futures::ProtocolReader;
@@ -25,7 +28,6 @@ use bitcoin::consensus::Encodable;
 use bitcoin::hashes::sha256d;
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
-use bitcoin::p2p::address::AddrV2;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message::RawNetworkMessage;
 use bitcoin::p2p::message::MAX_MSG_SIZE;
@@ -39,6 +41,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
+use tokio::io::ReadBuf;
 use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 use tokio::net::TcpStream;
@@ -53,6 +56,15 @@ use crate::address_man::LocalAddress;
 
 type TcpReadTransport = ReadTransport<BufReader<ReadHalf<TcpStream>>>;
 type TcpWriteTransport = WriteTransport<WriteHalf<TcpStream>>;
+type DirectTransportResult = Result<
+    (
+        TcpReadTransport,
+        TcpWriteTransport,
+        TransportProtocol,
+        Option<std::net::SocketAddr>,
+    ),
+    TransportError,
+>;
 type TransportResult =
     Result<(TcpReadTransport, TcpWriteTransport, TransportProtocol), TransportError>;
 
@@ -152,7 +164,31 @@ impl_error_from!(TransportError, Socks5Error, Proxy);
 
 pub enum ReadTransport<R: AsyncRead + Unpin + Send> {
     V1(R, Network),
-    V2(ProtocolReader<R>),
+    V2(ProtocolReader<V2Reader<R>>),
+}
+
+/// Reject closed V2 streams while bip324 0.10 does not terminate zero-byte reads.
+/// This can be removed when the fix from rust-bitcoin/bip324#160 is adopted.
+pub struct V2Reader<R>(R);
+
+impl<R: AsyncRead + Unpin> AsyncRead for V2Reader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let filled = buf.filled().len();
+        let remaining = buf.remaining();
+        match Pin::new(&mut self.0).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if remaining > 0 && buf.filled().len() == filled => {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "peer closed V2 transport",
+                )))
+            }
+            result => result,
+        }
+    }
 }
 
 pub enum WriteTransport<W: AsyncWrite + Unpin + Send + Sync> {
@@ -234,7 +270,7 @@ pub async fn connect<A: ToSocketAddrs>(
     address: A,
     network: Network,
     allow_v1_fallback: bool,
-) -> TransportResult {
+) -> DirectTransportResult {
     match try_connection(&address, network, false).await {
         Ok(transport) => Ok(transport),
         Err(TransportError::Protocol(ProtocolError::Io(_, ProtocolFailureSuggestion::RetryV1)))
@@ -250,16 +286,17 @@ async fn try_connection<A: ToSocketAddrs>(
     address: &A,
     network: Network,
     force_v1: bool,
-) -> TransportResult {
+) -> DirectTransportResult {
     let tcp_stream = TcpStream::connect(address).await?;
     // Data is buffered until there is enough to send out
     // thus reducing the amount of packages going through
     // the network.
     tcp_stream.set_nodelay(false)?;
 
-    let peer_addr = match tcp_stream.peer_addr() {
-        Ok(addr) => addr.to_string(),
-        Err(_) => String::from("unknown peer"),
+    let actual = tcp_stream.peer_addr().ok();
+    let peer_addr = match actual {
+        Some(addr) => addr.to_string(),
+        None => String::from("unknown peer"),
     };
     let (reader, writer) = tokio::io::split(tcp_stream);
     let reader = BufReader::new(reader);
@@ -271,9 +308,19 @@ async fn try_connection<A: ToSocketAddrs>(
                 ReadTransport::V1(reader, network),
                 WriteTransport::V1(writer, network),
                 TransportProtocol::V1,
+                actual,
             ))
         }
-        false => match Protocol::new(network, Role::Initiator, None, None, reader, writer).await {
+        false => match Protocol::new(
+            network,
+            Role::Initiator,
+            None,
+            None,
+            V2Reader(reader),
+            writer,
+        )
+        .await
+        {
             Ok(protocol) => {
                 debug!("Established a P2PV2 connection with peer={peer_addr}");
                 let (reader_protocol, writer_protocol) = protocol.into_split();
@@ -281,6 +328,7 @@ async fn try_connection<A: ToSocketAddrs>(
                     ReadTransport::V2(reader_protocol),
                     WriteTransport::V2(writer_protocol),
                     TransportProtocol::V2,
+                    actual,
                 ))
             }
             Err(e) => {
@@ -319,17 +367,7 @@ pub async fn connect_proxy<A: ToSocketAddrs + Clone + Debug>(
     network: Network,
     allow_v1_fallback: bool,
 ) -> TransportResult {
-    let addr = match address.get_addrv2() {
-        AddrV2::Cjdns(addr) => Socks5Addr::Ipv6(addr),
-        AddrV2::I2p(addr) => Socks5Addr::Domain(addr.into()),
-        AddrV2::Ipv4(addr) => Socks5Addr::Ipv4(addr),
-        AddrV2::Ipv6(addr) => Socks5Addr::Ipv6(addr),
-        AddrV2::TorV2(addr) => Socks5Addr::Domain(addr.into()),
-        AddrV2::TorV3(addr) => Socks5Addr::Domain(addr.into()),
-        AddrV2::Unknown(_, _) => {
-            return Err(TransportError::Proxy(Socks5Error::InvalidAddress));
-        }
-    };
+    let addr = Socks5Addr::try_from(address.get_addrv2())?;
 
     match try_proxy_connection(&proxy_addr, &addr, address.get_port(), network, false).await {
         Ok(transport) => Ok(transport),
@@ -362,7 +400,16 @@ async fn try_proxy_connection<A: ToSocketAddrs + Clone + Debug>(
                 TransportProtocol::V1,
             ))
         }
-        false => match Protocol::new(network, Role::Initiator, None, None, reader, writer).await {
+        false => match Protocol::new(
+            network,
+            Role::Initiator,
+            None,
+            None,
+            V2Reader(reader),
+            writer,
+        )
+        .await
+        {
             Ok(protocol) => {
                 debug!("Established a P2PV2 connection over SOCKS5 using proxy={proxy_addr:?} with peer={target_addr:?}");
                 let (reader_protocol, writer_protocol) = protocol.into_split();
@@ -404,6 +451,20 @@ where
                     return Ok(msg);
                 }
 
+                // utreexod assigns BIP324 short type 34 to its proof-bearing transaction.
+                if contents.first() == Some(&34) {
+                    let length = contents.len() - 1;
+                    if length > crate::proven_tx::MAX_BYTES {
+                        return Err(TransportError::OversizedMessage {
+                            max_size: crate::proven_tx::MAX_BYTES,
+                            message_size: length,
+                        });
+                    }
+                    return Ok(NetworkMessage::Unknown {
+                        command: CommandString::try_from_static("utreexotx").unwrap(),
+                        payload: contents[1..].to_vec(),
+                    });
+                }
                 let msg = deserialize_v2(contents)?;
                 Ok(msg)
             }
@@ -412,9 +473,14 @@ where
                 reader.read_exact(&mut data).await?;
 
                 let header: V1MessageHeader = deserialize_partial(&data)?.0;
-                if header.length as usize > MAX_MSG_SIZE {
+                let max_size = if header.command == *b"utreexotx\0\0\0" {
+                    crate::proven_tx::MAX_BYTES
+                } else {
+                    MAX_MSG_SIZE
+                };
+                if header.length as usize > max_size {
                     return Err(TransportError::OversizedMessage {
-                        max_size: MAX_MSG_SIZE,
+                        max_size,
                         message_size: header.length as usize,
                     });
                 }
@@ -718,5 +784,203 @@ mod tests {
             .expect("Message should be a valid ping");
 
         assert_eq!(res, NetworkMessage::Ping(0));
+    }
+}
+
+#[cfg(test)]
+mod v2_eof_tests {
+    use std::future::poll_fn;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use bip324::futures::Protocol;
+    use bip324::io::Payload;
+    use bip324::io::ProtocolError;
+    use bip324::OutboundCipher;
+    use bip324::Role;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::Network;
+    use tokio::io::AsyncRead;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::DuplexStream;
+    use tokio::io::ReadBuf;
+    use tokio::io::ReadHalf;
+
+    use super::ReadTransport;
+    use super::TransportError;
+    use super::V2Reader;
+    use crate::p2p_wire::peer::create_actors;
+    use crate::p2p_wire::peer::PeerError;
+    use crate::p2p_wire::peer::ReaderMessage;
+
+    // A timer cannot interrupt bip324's original ready-zero loop. Bound the number
+    // of EOF reads so these tests fail promptly even if the guard is removed.
+    struct CountedReader<R> {
+        inner: R,
+        zero_reads: Arc<AtomicUsize>,
+        max_chunk: usize,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for CountedReader<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let capacity = buf.remaining().min(self.max_chunk);
+            let mut chunk = vec![0; capacity];
+            let mut limited = ReadBuf::new(&mut chunk);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
+                Poll::Ready(Ok(())) => {
+                    if capacity > 0 && limited.filled().is_empty() {
+                        let count = self.zero_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                        if count > 8 {
+                            return Poll::Ready(Err(io::Error::other("EOF read budget exceeded")));
+                        }
+                    }
+                    buf.put_slice(limited.filled());
+                    Poll::Ready(Ok(()))
+                }
+                result => result,
+            }
+        }
+    }
+
+    type TestTransport = ReadTransport<CountedReader<ReadHalf<DuplexStream>>>;
+
+    async fn closed_frame(cut: usize, max_chunk: usize) -> (TestTransport, Arc<AtomicUsize>) {
+        let (local, remote) = tokio::io::duplex(4096);
+        let (local_read, local_write) = tokio::io::split(local);
+        let (remote_read, remote_write) = tokio::io::split(remote);
+        let zero_reads = Arc::new(AtomicUsize::new(0));
+        let reader = V2Reader(CountedReader {
+            inner: local_read,
+            zero_reads: zero_reads.clone(),
+            max_chunk,
+        });
+        let (local, remote) = tokio::join!(
+            Protocol::new(
+                Network::Regtest,
+                Role::Initiator,
+                None,
+                None,
+                reader,
+                local_write
+            ),
+            Protocol::new(
+                Network::Regtest,
+                Role::Responder,
+                None,
+                None,
+                remote_read,
+                remote_write
+            ),
+        );
+        let (local_reader, _local_writer) = local.unwrap().into_split();
+        let (_remote_reader, remote_writer) = remote.unwrap().into_split();
+        let (mut cipher, mut raw_writer) = remote_writer.into_inner();
+        let payload = Payload::genuine(bip324::serde::serialize(NetworkMessage::Ping(42)));
+        let mut packet = vec![0; OutboundCipher::encryption_buffer_len(payload.contents().len())];
+        cipher
+            .encrypt(payload.contents(), &mut packet, payload.packet_type(), None)
+            .unwrap();
+        raw_writer
+            .write_all(&packet[..cut.min(packet.len())])
+            .await
+            .unwrap();
+        raw_writer.shutdown().await.unwrap();
+        (ReadTransport::V2(local_reader), zero_reads)
+    }
+
+    fn assert_closed(error: TransportError) {
+        match error {
+            TransportError::Protocol(ProtocolError::Io(error, _)) => {
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+            }
+            error => panic!("expected V2 EOF error, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_eof_at_length_prefix_terminates() {
+        for cut in [0, 1, 2] {
+            let (mut transport, zero_reads) = closed_frame(cut, usize::MAX).await;
+            assert_closed(transport.read_message().await.unwrap_err());
+            assert_eq!(zero_reads.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_eof_in_payload_terminates() {
+        for cut in [3, 4, 7, 28] {
+            let (mut transport, zero_reads) = closed_frame(cut, usize::MAX).await;
+            assert_closed(transport.read_message().await.unwrap_err());
+            assert_eq!(zero_reads.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_fragmented_frame_remains_valid() {
+        let (mut transport, zero_reads) = closed_frame(usize::MAX, 1).await;
+        assert_eq!(
+            transport.read_message().await.unwrap(),
+            NetworkMessage::Ping(42)
+        );
+        assert_eq!(zero_reads.load(Ordering::SeqCst), 0);
+        assert_closed(transport.read_message().await.unwrap_err());
+        assert_eq!(zero_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn v2_eof_reaches_message_actor() {
+        let (transport, zero_reads) = closed_frame(0, usize::MAX).await;
+        let (mut receiver, actor) = create_actors(transport);
+        actor.run().await.unwrap();
+        match receiver.recv().await.unwrap() {
+            ReaderMessage::Error(PeerError::Transport(error)) => assert_closed(error),
+            _ => panic!("expected peer transport error"),
+        }
+        assert_eq!(zero_reads.load(Ordering::SeqCst), 1);
+        assert!(receiver.recv().await.is_none());
+    }
+
+    struct PendingThenError(bool);
+
+    impl AsyncRead for PendingThenError {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.0 {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "test error")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_reader_preserves_pending_errors_and_empty_reads() {
+        let mut reader = V2Reader(PendingThenError(false));
+        let mut data = [0; 1];
+        let error = reader.read(&mut data).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "test error");
+
+        let mut reader = V2Reader(tokio::io::empty());
+        let mut empty = [];
+        let mut buf = ReadBuf::new(&mut empty);
+        poll_fn(|cx| Pin::new(&mut reader).poll_read(cx, &mut buf))
+            .await
+            .unwrap();
     }
 }

@@ -15,6 +15,11 @@ use floresta_node::AssumeValidArg;
     long_about = env!("LONG_VERSION"),
 )]
 pub struct Cli {
+    /// Use Chicory's inherited control pipe and an ephemeral loopback Electrum listener.
+    #[arg(long, requires = "data_dir", conflicts_with_all = ["rpc_address", "electrum_address", "enable_electrum_tls", "config_file", "wallet_descriptor", "wallet_xpub", "log_to_file", "debug", "no_cfilters", "no_assume_utreexo", "no_backfill"])]
+    #[cfg_attr(unix, arg(conflicts_with = "daemon"))]
+    pub managed_stdio: bool,
+
     #[arg(long, default_value_t = false)]
     /// Whether to disable DNS seeds
     pub disable_dns_seeds: bool,
@@ -42,6 +47,18 @@ pub struct Cli {
     /// the wallet, the logs, the compact block filters, the Utreexo state, etc.
     /// Defaults to `~/.floresta`. The passed value should be an absolute path.
     pub data_dir: Option<String>,
+
+    /// Remove only the checked Chicory database files for this profile fingerprint.
+    #[arg(long, requires = "data_dir", conflicts_with = "managed_stdio")]
+    pub managed_cleanup_for: Option<String>,
+
+    /// Build-bound fingerprint to verify under the managed database lock.
+    #[arg(long, requires = "managed_stdio")]
+    pub managed_store_owner: Option<String>,
+
+    /// Publish the next owner only after a complete guarded offline removal.
+    #[arg(long, requires = "managed_cleanup_for")]
+    pub managed_next_owner: Option<String>,
 
     #[arg(long)]
     /// Whether Compact Block Filters should be disabled

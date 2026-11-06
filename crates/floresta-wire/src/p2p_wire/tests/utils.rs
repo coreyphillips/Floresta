@@ -175,7 +175,7 @@ pub fn create_peer(
 
     LocalPeerView {
         message_times: Ema::with_half_life_50(),
-        address: "127.0.0.1".parse().unwrap(),
+        address: IpAddr::V4((0x7f00_0001 + peer_id).into()),
         services: service_flags::UTREEXO.into(),
         user_agent: "/utreexo:0.1.0/".to_string(),
         height: 0,
@@ -445,4 +445,368 @@ mod tests {
             assert_eq!(i as u64, leaves, "one leaf added per block");
         }
     }
+}
+
+fn routing_node() -> (
+    String,
+    UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+) {
+    let dir = format!("./tmp-db/{}.proof_routes", rand::random::<u32>());
+    let store = FlatChainStore::new(FlatChainStoreConfig::new(dir.clone())).unwrap();
+    let chain = Arc::new(ChainState::new(
+        store,
+        Network::Regtest,
+        AssumeValidArg::Disabled,
+    ));
+    let node = UtreexoNode::<_, SyncNode>::new(
+        get_node_config(dir.clone(), Network::Regtest, false),
+        chain,
+        Arc::new(Mutex::new(Mempool::new(1000))),
+        None,
+        Arc::new(RwLock::new(false)),
+        AddressMan::new(None, &[]),
+    )
+    .unwrap();
+    (dir, node)
+}
+
+fn routing_peer(
+    node: &mut UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+    id: u32,
+    services: ServiceFlags,
+) -> UnboundedReceiver<NodeRequest> {
+    let (channel, receiver) = unbounded_channel();
+    let mut latency = Ema::with_half_life_50();
+    latency.add(0.01);
+    node.peers.insert(
+        id,
+        LocalPeerView {
+            address: "127.0.0.1".parse().unwrap(),
+            port: 8333,
+            services,
+            channel,
+            user_agent: "fixture".into(),
+            height: 100,
+            state: PeerStatus::Ready,
+            kind: ConnectionKind::Regular(services),
+            banscore: 0,
+            address_id: id as usize,
+            _last_message: Instant::now(),
+            transport_protocol: TransportProtocol::V2,
+            message_times: latency,
+        },
+    );
+    receiver
+}
+
+#[tokio::test]
+async fn a_pinned_second_port_fills_a_missing_proof_service_only() {
+    use crate::address_man::LocalAddress;
+
+    let (dir, mut node) = routing_node();
+    // Keep both disposable TCP ports claimed by this test throughout. No handshake leaves loopback.
+    let core = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let core_addr = core.local_addr().unwrap();
+    let mut raw = LocalAddress::try_from(core_addr.to_string().as_str()).unwrap();
+    let mut proof =
+        LocalAddress::try_from(bridge.local_addr().unwrap().to_string().as_str()).unwrap();
+    let proof_service: ServiceFlags = service_flags::UTREEXO.into();
+    raw.set_services(ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    proof.set_services(proof_service | ServiceFlags::WITNESS);
+    node.open_connection(
+        ConnectionKind::Regular(ServiceFlags::NETWORK),
+        raw.clone(),
+        false,
+    )
+    .unwrap();
+    let requested = ConnectionKind::Regular(proof_service);
+    assert!(node
+        .open_connection(requested, proof.clone(), false)
+        .is_err());
+    let first_id = node.peers.keys().copied().next().unwrap();
+    let first = node.peers.get_mut(&first_id).unwrap();
+    first.services = raw.get_services();
+    first.state = PeerStatus::Ready;
+    assert!(node
+        .open_connection(
+            ConnectionKind::Regular(ServiceFlags::NONE),
+            proof.clone(),
+            false
+        )
+        .is_err());
+    assert!(node.open_connection(requested, raw.clone(), false).is_err());
+    node.open_connection(requested, proof.clone(), false)
+        .unwrap();
+    let second = node
+        .peers
+        .values_mut()
+        .find(|p| p.port == proof.get_port())
+        .unwrap();
+    second.state = PeerStatus::Ready;
+    second.services = proof.get_services();
+    assert_eq!(node.connected_peers(), 2);
+    assert_eq!(node.connected_hosts(), 1);
+    assert_eq!(node.peers[&first_id].address_id, raw.id);
+    assert!(node
+        .open_connection(requested, proof.clone(), false)
+        .is_err());
+
+    node.peers.remove(&first_id);
+    // Reverse arrival order: a verified proof-only peer keeps its connection while raw
+    // blocks come from the other pinned port. Generic and duplicate attempts are refused.
+    assert!(node
+        .open_connection(
+            ConnectionKind::Regular(ServiceFlags::NONE),
+            raw.clone(),
+            false
+        )
+        .is_err());
+    node.open_connection(
+        ConnectionKind::Regular(ServiceFlags::NETWORK),
+        raw.clone(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(node.peers.len(), 2);
+
+    // Exact operator-supplied port and address ID survive reconnect without relying on live IDs.
+    node.peers.clear();
+    node.handle_addnode_add_peer(core_addr.ip(), core_addr.port(), true)
+        .unwrap();
+    let explicit = node.added_peers[0].endpoint.clone();
+    assert_eq!(explicit.get_socket_address(), core_addr);
+    assert_eq!(node.peers.values().next().unwrap().address_id, explicit.id);
+    node.peers.clear();
+    node.maybe_open_connection_with_added_peers().unwrap();
+    assert_eq!(node.peers.values().next().unwrap().address_id, explicit.id);
+    assert_eq!(node.peers.values().next().unwrap().port, core_addr.port());
+    node.handle_addnode_onetry_peer(core_addr.ip(), proof.get_port(), true)
+        .unwrap();
+    assert_eq!(node.peers.len(), 2);
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn block_and_proof_requests_use_different_peers() {
+    use crate::node_interface::UserRequest;
+    use tokio::sync::oneshot;
+
+    let (dir, mut node) = routing_node();
+    let mut blocks = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let mut proofs = routing_peer(
+        &mut node,
+        2,
+        ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into(),
+    );
+    let hash = signet_headers()[1].block_hash();
+    node.request_blocks(vec![hash]).unwrap();
+    assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]));
+    assert!(proofs.try_recv().is_err());
+
+    // A single available peer of the wrong class must not receive an arbitrary
+    // historical block or proof request, even when it has the lowest latency.
+    let full = node.peers.remove(&1).unwrap();
+    node.perform_user_request(UserRequest::Block(hash), oneshot::channel().0)
+        .await;
+    assert!(proofs.try_recv().is_err());
+    node.perform_user_request(UserRequest::UtreexoProof(hash), oneshot::channel().0)
+        .await;
+    assert!(matches!(proofs.try_recv(), Ok(NodeRequest::GetBlockProof((h, _, _))) if h == hash));
+    node.peers.insert(1, full);
+    node.peers.remove(&2);
+    node.perform_user_request(UserRequest::UtreexoProof(hash), oneshot::channel().0)
+        .await;
+    assert!(blocks.try_recv().is_err());
+    node.perform_user_request(UserRequest::Block(hash), oneshot::channel().0)
+        .await;
+    assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]));
+
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn archival_routes_cover_history_live_boundary_and_retries() {
+    use crate::node_interface::UserRequest;
+    use tokio::sync::oneshot;
+    let (dir, mut node) = routing_node();
+    let mut blocks = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let mut recent = routing_peer(&mut node, 2, service_flags::UTREEXO.into());
+    let mut archive = routing_peer(&mut node, 3, service_flags::UTREEXO_ARCHIVE.into());
+
+    // Mine local regtest headers and test both sides of the BIP183 288-block boundary.
+    let mut header = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+    let mut hashes = vec![header.block_hash()];
+    for _ in 1..=289 {
+        header.prev_blockhash = header.block_hash();
+        header.time += 600;
+        header.nonce = 0;
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        hashes.push(header.block_hash());
+        node.chain.accept_header(header).unwrap();
+    }
+    for (hash, receiver) in [(hashes[1], &mut archive), (hashes[2], &mut recent)] {
+        node.perform_user_request(UserRequest::UtreexoProof(hash), oneshot::channel().0)
+            .await;
+        assert!(
+            matches!(receiver.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash)
+        );
+    }
+    assert!(blocks.try_recv().is_err());
+
+    // The initial block request, a missed proof and a timed-out proof must
+    // all use the same routing rules. This block has non-coinbase spends.
+    let bytes = zstd::decode_all(
+        &include_bytes!("../../../../floresta-chain/testdata/block_367891/raw.zst")[..],
+    )
+    .unwrap();
+    let block: Block = encode::deserialize(&bytes).unwrap();
+    let hash = block.block_hash();
+    node.request_block_proof(block, 1).unwrap();
+    assert!(matches!(archive.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash));
+    let req = InflightRequests::UtreexoProof(hash);
+    node.inflight.remove(&req);
+    node.redo_inflight_request(&req, 3).unwrap();
+    assert!(matches!(recent.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash));
+    node.inflight.remove(&req);
+    node.peers.remove(&2);
+    node.ask_for_missed_proofs().unwrap();
+    assert!(matches!(archive.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hash));
+    node.request_blocks(vec![hashes[2]]).unwrap();
+    assert!(matches!(blocks.try_recv(), Ok(NodeRequest::GetBlock(ids)) if ids == [hashes[2]]));
+    assert!(archive.try_recv().is_err());
+
+    // A full NODE_NETWORK + NODE_UTREEXO peer also promises all historical proofs.
+    node.peers.remove(&3);
+    let mut full = routing_peer(
+        &mut node,
+        4,
+        ServiceFlags::NETWORK | service_flags::UTREEXO.into(),
+    );
+    let _opportunistic = routing_peer(&mut node, 5, service_flags::UTREEXO.into());
+    node.perform_user_request(UserRequest::UtreexoProof(hashes[1]), oneshot::channel().0)
+        .await;
+    assert!(
+        matches!(full.try_recv(), Ok(NodeRequest::GetBlockProof((id, _, _))) if id == hashes[1])
+    );
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn body_timeout_old_hash(
+    node: &mut UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+) -> bitcoin::BlockHash {
+    let mut header = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+    let mut requested = header.block_hash();
+    for height in 1..=289 {
+        header.prev_blockhash = header.block_hash();
+        header.time += 600;
+        header.nonce = 0;
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        node.chain.accept_header(header).unwrap();
+        if height == 1 {
+            requested = header.block_hash();
+        }
+    }
+    requested
+}
+
+#[tokio::test]
+async fn body_timeout_retries_another_historical_provider() {
+    let (dir, mut node) = routing_node();
+    let hash = body_timeout_old_hash(&mut node);
+    // A limited peer cannot serve this historical body.
+    let mut limited = routing_peer(
+        &mut node,
+        0,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+    );
+    let mut previous = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let mut alternate = routing_peer(&mut node, 2, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let request = InflightRequests::Blocks(hash);
+    let expired = Instant::now() - std::time::Duration::from_secs(121);
+    node.inflight.insert(request.clone(), (1, expired));
+    node.check_for_timeout().unwrap();
+    let actual = node.inflight.get(&request).unwrap().0;
+    let sent_to_previous = previous.try_recv().is_ok();
+    let sent_to_alternate =
+        matches!(alternate.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]);
+    let sent_to_limited = limited.try_recv().is_ok();
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+    eprintln!("body timeout route: previous={sent_to_previous}, alternate={sent_to_alternate}, limited={sent_to_limited}, inflight_owner={actual}");
+    assert!(
+        !sent_to_limited,
+        "limited peer must not receive a historical block"
+    );
+    assert_eq!(
+        actual, 2,
+        "body retry must first try another eligible full provider"
+    );
+    assert!(!sent_to_previous);
+    assert!(sent_to_alternate);
+}
+
+#[tokio::test]
+async fn body_timeout_preserves_lone_historical_provider_fallback() {
+    let (dir, mut node) = routing_node();
+    let hash = body_timeout_old_hash(&mut node);
+    let mut limited = routing_peer(
+        &mut node,
+        0,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+    );
+    let mut previous = routing_peer(&mut node, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    let request = InflightRequests::Blocks(hash);
+    let expired = Instant::now() - std::time::Duration::from_secs(121);
+    node.inflight.insert(request.clone(), (1, expired));
+    node.check_for_timeout().unwrap();
+    let (actual, retried_at) = *node.inflight.get(&request).unwrap();
+    let sent_to_previous =
+        matches!(previous.try_recv(), Ok(NodeRequest::GetBlock(items)) if items == [hash]);
+    let sent_to_limited = limited.try_recv().is_ok();
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(
+        actual, 1,
+        "lone eligible full provider must remain retryable"
+    );
+    assert!(retried_at > expired);
+    assert!(sent_to_previous);
+    assert!(!sent_to_limited);
+}
+
+#[tokio::test]
+async fn body_timeout_does_not_fall_back_to_limited_only_peers() {
+    let (dir, mut node) = routing_node();
+    let hash = body_timeout_old_hash(&mut node);
+    let mut limited = routing_peer(
+        &mut node,
+        0,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+    );
+    let request = InflightRequests::Blocks(hash);
+    let expired = Instant::now() - std::time::Duration::from_secs(121);
+    node.inflight.insert(request.clone(), (1, expired));
+    let error = node.check_for_timeout().unwrap_err();
+    let retained = *node.inflight.get(&request).unwrap();
+    let sent_to_limited = limited.try_recv().is_ok();
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(matches!(
+        error,
+        crate::p2p_wire::error::WireError::NoPeersAvailable
+    ));
+    assert_eq!(
+        retained,
+        (1, expired),
+        "unavailable retry must retain the original inflight"
+    );
+    assert!(!sent_to_limited);
 }

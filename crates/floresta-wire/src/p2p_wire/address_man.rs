@@ -380,6 +380,18 @@ impl AddressMan {
         }
     }
 
+    /// Copy known addresses for a node with its own, initially empty connection set.
+    /// Connections belong to the source node, while bans and retry cooldowns remain shared history.
+    pub(crate) fn clone_for_new_node(&self) -> Self {
+        let mut addresses = self.clone();
+        for address in addresses.addresses.values_mut() {
+            if address.state == AddressState::Connected {
+                address.state = AddressState::Tried(address.last_connected);
+            }
+        }
+        addresses
+    }
+
     /// Returns the current timestamp since the epoch
     fn time_since_unix() -> u64 {
         SystemTime::now()
@@ -388,14 +400,26 @@ impl AddressMan {
             .as_secs()
     }
 
+    // Bridges can serve BIP183 inclusion proofs without serving block bodies.
+    fn useful_services(flags: ServiceFlags) -> bool {
+        flags.has(service_flags::UTREEXO_ARCHIVE.into())
+            || (flags.has(ServiceFlags::WITNESS)
+                && (flags.has(ServiceFlags::NETWORK_LIMITED)
+                    || flags.has(service_flags::UTREEXO.into())))
+    }
+
     /// Add a new address to our list of known address
     pub fn push_addresses(&mut self, addresses: &[LocalAddress]) {
+        self.insert_addresses(addresses, false);
+    }
+
+    // Gossip cannot create additional identities by cycling through ports. Only fixed seeds,
+    // explicit user endpoints, and entries restored from our own store may share a host.
+    fn insert_addresses(&mut self, addresses: &[LocalAddress], local: bool) {
         for address in addresses {
             let id = address.id;
             // don't add addresses that don't have the minimum required services
-            if !address.services.has(ServiceFlags::WITNESS)
-                || !address.services.has(ServiceFlags::NETWORK_LIMITED)
-            {
+            if !Self::useful_services(address.services) {
                 continue;
             }
 
@@ -412,18 +436,25 @@ impl AddressMan {
             if self
                 .addresses
                 .values()
-                .any(|x| x.address == address.address)
+                .any(|x| x.address == address.address && (!local || x.port == address.port))
             {
                 continue;
             }
 
+            let mut address = address.clone();
+            if let Some(until) = self.banned_until(&address.address) {
+                address.state = AddressState::Banned(until);
+            }
+            let address = &address;
             if let std::collections::hash_map::Entry::Vacant(e) = self.addresses.entry(id) {
                 e.insert(address.clone());
                 if address.is_good_address() {
                     self.good_addresses.push(id);
                 }
 
+                self.push_if_has_service(address, ServiceFlags::NETWORK);
                 self.push_if_has_service(address, service_flags::UTREEXO.into());
+                self.push_if_has_service(address, service_flags::UTREEXO_ARCHIVE.into());
                 self.push_if_has_service(address, ServiceFlags::NONE); // this means any peer
                 self.push_if_has_service(address, ServiceFlags::COMPACT_FILTERS);
             }
@@ -431,6 +462,44 @@ impl AddressMan {
 
         // Open up space by pruning old addresses
         self.prune_addresses();
+    }
+
+    // Explicit loopback/private peers remain usable without advertising them to the network.
+    pub(crate) fn manual_endpoint(&mut self, host: AddrV2, port: u16) -> LocalAddress {
+        let mut endpoint = LocalAddress::from(host);
+        endpoint.set_port(port);
+        endpoint.set_services(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS);
+        self.remember_local_endpoint(endpoint)
+    }
+
+    pub(crate) fn remember_local_endpoint(&mut self, mut endpoint: LocalAddress) -> LocalAddress {
+        if let Some(known) = self
+            .addresses
+            .values()
+            .find(|a| a.address == endpoint.address && a.port == endpoint.port)
+        {
+            return known.clone();
+        }
+        while self.addresses.contains_key(&endpoint.id) {
+            endpoint.id = rand::random();
+        }
+        self.insert_addresses(std::slice::from_ref(&endpoint), true);
+        self.addresses
+            .get(&endpoint.id)
+            .cloned()
+            .unwrap_or(endpoint)
+    }
+
+    pub(crate) fn banned_until(&self, host: &AddrV2) -> Option<u64> {
+        let now = Self::time_since_unix();
+        self.addresses
+            .values()
+            .filter(|addr| &addr.address == host)
+            .filter_map(|addr| match addr.state {
+                AddressState::Banned(until) if until > now => Some(until),
+                _ => None,
+            })
+            .max()
     }
 
     /// Check if we can reach this address based on our reachable networks
@@ -585,13 +654,22 @@ impl AddressMan {
         default_port: u16,
         socks5: Option<SocketAddr>,
     ) -> Result<Vec<LocalAddress>, std::io::Error> {
+        Ok(Self::get_seeds_with_lookup(seed, |host| {
+            Self::do_lookup(host, default_port, socks5)
+        }))
+    }
+
+    fn get_seeds_with_lookup(
+        seed: &DnsSeed,
+        mut lookup: impl FnMut(&str) -> Vec<LocalAddress>,
+    ) -> Vec<LocalAddress> {
         let mut addresses = Vec::new();
         let now = Self::time_since_unix();
 
         // ask for utreexo peers (if filtering is available)
         if seed.filters.has(service_flags::UTREEXO.into()) {
             let host = format!("x1000.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
+            let _addresses = lookup(&host);
             let _addresses = _addresses.into_iter().map(|mut x| {
                 x.services = ServiceFlags::NETWORK_LIMITED
                     | service_flags::UTREEXO.into()
@@ -606,7 +684,7 @@ impl AddressMan {
         // ask for compact filter peers (if filtering is available)
         if seed.filters.has(ServiceFlags::COMPACT_FILTERS) {
             let host = format!("x49.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
+            let _addresses = lookup(&host);
             let _addresses = _addresses.into_iter().map(|mut x| {
                 x.services = ServiceFlags::COMPACT_FILTERS
                     | ServiceFlags::NETWORK_LIMITED
@@ -621,7 +699,7 @@ impl AddressMan {
         // ask for any peer (if filtering is available)
         if seed.filters.has(ServiceFlags::WITNESS) {
             let host = format!("x9.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
+            let _addresses = lookup(&host);
             let _addresses = _addresses.into_iter().map(|mut x| {
                 x.services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
                 x.state = AddressState::Tried(now);
@@ -633,9 +711,9 @@ impl AddressMan {
 
         // ask for any peer (if filtering isn't available)
         if seed.filters == ServiceFlags::NONE {
-            let _addresses = Self::do_lookup(seed.seed, default_port, socks5);
+            let _addresses = lookup(seed.seed);
             let _addresses = _addresses.into_iter().map(|mut x| {
-                x.services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+                x.services = seed.unfiltered_services;
                 x.state = AddressState::Tried(now);
                 x
             });
@@ -643,15 +721,14 @@ impl AddressMan {
             addresses.extend(_addresses);
         }
 
-        Ok(addresses)
+        addresses
     }
 
     /// Returns a new random address to open a new connection, we try to get addresses with
     /// a set of features supported for our peers
     ///
-    /// If no peers are known with the required service bit, we may return a random peer.
-    /// Service bits are learned from DNS seeds or peer gossip and may be outdated or
-    /// inaccurate, so we sometimes try random peers expecting they might implement the service.
+    /// Exact block and proof roles only use addresses advertising that service.
+    /// Non-specialized searches can probe other addresses whose advertised services are stale.
     pub fn get_address_to_connect(
         &mut self,
         required_service: ServiceFlags,
@@ -765,7 +842,7 @@ impl AddressMan {
                 .map(Into::<LocalAddress>::into)
                 .collect::<Vec<_>>();
 
-            self.push_addresses(&peers);
+            self.insert_addresses(&peers, true);
         }
 
         let anchors = read_to_string(format!("{datadir}/anchors.json")).and_then(|anchors| {
@@ -813,9 +890,7 @@ impl AddressMan {
 
     /// Attempt to find one random peer that advertises the required service
     ///
-    /// If we cannot find a peer that advertises the required service, we return any peer
-    /// that we have in our list of known peers. Luckily, either we'll connect to a peer that has
-    /// this but we didn't know, or one of those peers will give us useful addresses.
+    /// Skip recently failed and currently connected candidates.
     fn try_with_service(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
         if let Some(peers) = self.peers_by_service.get(&service) {
             let peers = peers
@@ -859,16 +934,47 @@ impl AddressMan {
             return Some(address);
         }
 
-        // if we can't find a peer that advertises the required service, get any peer
+        // A proof search must not consume every known block endpoint, or vice versa.
+        // Ordinary discovery and feelers still try addresses with other capabilities.
+        if service == ServiceFlags::NETWORK
+            || service == service_flags::UTREEXO.into()
+            || service == service_flags::UTREEXO_ARCHIVE.into()
+        {
+            return None;
+        }
+
+        // For other roles, try an address whose advertised services may be stale.
         let idx = rand::random::<usize>() % self.addresses.len();
         let peer = self.addresses.keys().nth(idx)?;
 
         Some((*peer, self.addresses.get(peer)?.to_owned()))
     }
 
+    // A host ban applies across every known port, including a newly restored seed.
+    pub(crate) fn ban_host(&mut self, id: usize, duration: u64) {
+        let Some(host) = self.addresses.get(&id).map(|a| a.address.clone()) else {
+            return;
+        };
+        let until = Self::time_since_unix().saturating_add(duration);
+        let mut banned = HashSet::new();
+        for address in self.addresses.values_mut().filter(|a| a.address == host) {
+            address.state = AddressState::Banned(until);
+            banned.insert(address.id);
+        }
+        self.good_addresses.retain(|id| !banned.contains(id));
+        for peers in self.good_peers_by_service.values_mut() {
+            peers.retain(|id| !banned.contains(id));
+        }
+    }
+
     /// Updates the state of an address
     pub fn update_set_state(&mut self, idx: usize, state: AddressState) -> &mut Self {
         if let Some(address) = self.addresses.get_mut(&idx) {
+            if matches!(address.state, AddressState::Banned(until) if until > Self::time_since_unix())
+            {
+                // A late disconnect or handshake cannot cancel a host ban.
+                return self;
+            }
             address.state = state;
         }
 
@@ -882,6 +988,7 @@ impl AddressMan {
                 }
 
                 if let Some(address) = self.addresses.get(&idx).cloned() {
+                    self.push_if_has_service(&address, ServiceFlags::NETWORK);
                     self.push_if_has_service(&address, service_flags::UTREEXO.into());
                     self.push_if_has_service(&address, service_flags::UTREEXO_ARCHIVE.into());
                     self.push_if_has_service(&address, ServiceFlags::NONE); // this means any peer
@@ -902,7 +1009,9 @@ impl AddressMan {
 
                 // push to the good peers by service
                 if let Some(address) = self.addresses.get(&idx).cloned() {
+                    self.push_if_has_service(&address, ServiceFlags::NETWORK);
                     self.push_if_has_service(&address, service_flags::UTREEXO.into());
+                    self.push_if_has_service(&address, service_flags::UTREEXO_ARCHIVE.into());
                     self.push_if_has_service(&address, ServiceFlags::NONE); // this means any peer
                     self.push_if_has_service(&address, ServiceFlags::COMPACT_FILTERS);
                 }
@@ -918,40 +1027,18 @@ impl AddressMan {
         self
     }
 
-    /// Adds a peer to the list of peers known to have some service
-    fn add_peer_to_service(&mut self, idx: usize, service: ServiceFlags) {
-        if let Some(peers) = self.peers_by_service.get_mut(&service) {
-            if peers.contains(&idx) {
-                return;
-            }
-
-            peers.push(idx);
-        } else {
-            self.peers_by_service.insert(service, vec![idx]);
-        }
-    }
-
-    /// Removes a peer from the list of peers known to have some service
-    fn remove_peer_from_service(&mut self, idx: usize, service: ServiceFlags) {
-        if let Some(peers) = self.peers_by_service.get_mut(&service) {
-            peers.retain(|&x| x != idx);
-        }
-    }
-
-    /// Updates the list of peers that have a service
-    ///
-    /// If a peer used to advertise a service, but now it doesn't, we remove it from the list
-    /// of peers that have that service. If a peer didn't advertise a service, but now it does,
-    /// we add it to the list of peers that have that service.
+    /// Reconcile both candidate lists after a verified version message.
     fn update_peer_for_service(&mut self, id: usize, service: ServiceFlags) {
-        let Some(peer) = self.addresses.get(&id) else {
+        let Some(peer) = self.addresses.get(&id).cloned() else {
             return;
         };
-
-        match peer.services.has(service) {
-            true => self.add_peer_to_service(id, service),
-            false => self.remove_peer_from_service(id, service),
+        if let Some(peers) = self.peers_by_service.get_mut(&service) {
+            peers.retain(|&p| p != id);
         }
+        if let Some(peers) = self.good_peers_by_service.get_mut(&service) {
+            peers.retain(|&p| p != id);
+        }
+        self.push_if_has_service(&peer, service);
     }
 
     /// Updates `peers_by_service` buckets with the latest service flags info about a peer
@@ -959,19 +1046,18 @@ impl AddressMan {
     /// This function is called when we receive a version message from a peer, telling which
     /// services it advertises.
     ///
-    /// We only index for Compact Filters and Utreexo. For NODE_NETWORK and NODE_WITNESS we already
-    /// filter them out when we add them to the address manager, therefore, all peers in this list
-    /// is already known for having those. And we don't care about the rest of the services,
-    /// like NODE_BLOOM.
+    /// Block and proof services are independent capabilities.
     fn update_peer_services_buckets(&mut self, idx: usize) {
+        self.update_peer_for_service(idx, ServiceFlags::NETWORK);
         self.update_peer_for_service(idx, service_flags::UTREEXO.into());
+        self.update_peer_for_service(idx, service_flags::UTREEXO_ARCHIVE.into());
         self.update_peer_for_service(idx, ServiceFlags::COMPACT_FILTERS);
     }
 
     /// Updates the service flags after we receive a version message
     pub fn update_set_service_flag(&mut self, idx: usize, flags: ServiceFlags) -> &mut Self {
         // if this peer turns out to not have the minimum required services, we remove it
-        if !flags.has(ServiceFlags::NETWORK_LIMITED) || !flags.has(ServiceFlags::WITNESS) {
+        if !Self::useful_services(flags) {
             self.addresses.remove(&idx);
             for peers in self.peers_by_service.values_mut() {
                 peers.retain(|&x| x != idx);
@@ -1018,7 +1104,7 @@ impl AddressMan {
             .map(Into::<LocalAddress>::into)
             .collect::<Vec<_>>();
 
-        self.push_addresses(&peers);
+        self.insert_addresses(&peers, true);
     }
 }
 
@@ -1229,6 +1315,221 @@ mod test {
     use crate::address_man::DiskLocalAddress;
     use crate::address_man::ReachableNetworks;
     use crate::address_man::SUPPORTED_NETWORKS;
+
+    #[test]
+    fn unfiltered_utreexo_seed_is_queried_bare_and_selected_for_proofs() {
+        let seeds = get_chain_dns_seeds(Network::Bitcoin);
+        let seed = seeds
+            .iter()
+            .find(|seed| seed.seed == "manualseed.calvinkim.info")
+            .unwrap();
+        let mut queried = Vec::new();
+        let addresses = AddressMan::get_seeds_with_lookup(seed, |host| {
+            queried.push(host.to_owned());
+            vec![LocalAddress::try_from("8.8.8.8:8333").unwrap()]
+        });
+        assert_eq!(queried, ["manualseed.calvinkim.info"]);
+        assert_eq!(addresses.len(), 1);
+        assert!(addresses[0].services.has(service_flags::UTREEXO.into()));
+        assert!(addresses[0]
+            .services
+            .has(service_flags::UTREEXO_ARCHIVE.into()));
+        let mut manager = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        manager.push_addresses(&addresses);
+        assert!(manager
+            .get_address_to_connect(service_flags::UTREEXO_ARCHIVE.into(), false)
+            .is_some());
+        let recent_only =
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | service_flags::UTREEXO.into();
+        manager.update_set_service_flag(addresses[0].id, recent_only);
+        assert!(manager
+            .get_address_by_service(service_flags::UTREEXO_ARCHIVE.into())
+            .is_none());
+        assert_eq!(
+            manager
+                .get_address_by_service(service_flags::UTREEXO.into())
+                .unwrap()
+                .0,
+            addresses[0].id
+        );
+    }
+
+    #[test]
+    fn independent_node_can_select_connected_archives_without_clearing_peer_history() {
+        let archive: ServiceFlags = service_flags::UTREEXO_ARCHIVE.into();
+        let body = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::NETWORK_LIMITED;
+        let mut source = AddressMan::new(Some(20), &[ReachableNetworks::IPv4]);
+        let host = AddrV2::Ipv4("8.8.8.8".parse().unwrap());
+        let core = source.manual_endpoint(host.clone(), 8333);
+        let bridge = source.manual_endpoint(host.clone(), 8335);
+        let banned = source.manual_endpoint(AddrV2::Ipv4("8.8.4.4".parse().unwrap()), 8335);
+        let failed = source.manual_endpoint(AddrV2::Ipv4("1.1.1.1".parse().unwrap()), 8335);
+        let untried = source.manual_endpoint(AddrV2::Ipv4("9.9.9.9".parse().unwrap()), 8333);
+        let tried = source.manual_endpoint(AddrV2::Ipv4("4.2.2.2".parse().unwrap()), 8333);
+        for peer in [&bridge, &banned, &failed] {
+            source.update_set_service_flag(peer.id, archive);
+        }
+        for peer in [&core, &untried, &tried] {
+            source.update_set_service_flag(peer.id, body);
+        }
+        let now = AddressMan::time_since_unix();
+        source.update_set_state(core.id, AddressState::Connected);
+        source.update_set_state(bridge.id, AddressState::Connected);
+        source.ban_host(banned.id, 86400);
+        source.update_set_state(failed.id, AddressState::Failed(now));
+        source.update_set_state(tried.id, AddressState::Tried(now - 10));
+        let original = source.clone();
+        let mut ordinary = source.clone();
+        assert!(source.get_address_to_connect(archive, false).is_none());
+        assert!(ordinary.get_address_to_connect(archive, false).is_none());
+
+        let mut independent = source.clone_for_new_node();
+        let (id, selected) = independent.get_address_to_connect(archive, false).unwrap();
+        assert_eq!(independent.max_size, source.max_size);
+        assert_eq!(independent.reachable_networks, source.reachable_networks);
+        assert_eq!(independent.good_addresses, source.good_addresses);
+        assert_eq!(
+            independent.good_peers_by_service,
+            source.good_peers_by_service
+        );
+        assert_eq!(independent.peers_by_service, source.peers_by_service);
+        assert_eq!(independent.addresses.len(), source.addresses.len());
+        for (id, address) in &source.addresses {
+            let mut expected = address.clone();
+            if expected.state == AddressState::Connected {
+                expected.state = AddressState::Tried(expected.last_connected);
+            }
+            assert_eq!(independent.addresses[id], expected);
+        }
+        assert_eq!(id, bridge.id);
+        assert_eq!(selected.address, host);
+        assert_eq!(selected.port, 8335);
+        assert_eq!(selected.services, archive);
+        assert_eq!(independent.manual_endpoint(host.clone(), 8333).id, core.id);
+        assert_eq!(independent.manual_endpoint(host, 8335).id, bridge.id);
+        assert_eq!(source.addresses, original.addresses);
+        assert_eq!(ordinary.addresses, original.addresses);
+        assert_eq!(source.addresses[&bridge.id].state, AddressState::Connected);
+
+        // Once the independent archive connection is also occupied, neither the
+        // banned archive nor the archive in its failure cooldown becomes eligible.
+        independent.update_set_state(bridge.id, AddressState::Connected);
+        assert!(independent.get_address_to_connect(archive, false).is_none());
+        assert_eq!(
+            independent.addresses[&banned.id],
+            original.addresses[&banned.id]
+        );
+        assert_eq!(
+            independent.addresses[&failed.id],
+            original.addresses[&failed.id]
+        );
+    }
+
+    #[test]
+    fn ordinary_unfiltered_seed_keeps_ordinary_candidate_services() {
+        let seed =
+            floresta_chain::DnsSeed::new(Network::Testnet, "ordinary.example", ServiceFlags::NONE);
+        let addresses = AddressMan::get_seeds_with_lookup(&seed, |host| {
+            assert_eq!(host, "ordinary.example");
+            vec![LocalAddress::try_from("8.8.8.8:18333").unwrap()]
+        });
+        assert_eq!(
+            addresses[0].services,
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS
+        );
+        assert!(AddressMan::get_seeds_with_lookup(&seed, |_| Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn mainnet_and_signet_fixed_seeds_are_separate() {
+        let peers = |network| {
+            let disk: Vec<DiskLocalAddress> =
+                serde_json::from_str(AddressMan::get_net_seeds(network)).unwrap();
+            disk.into_iter().map(LocalAddress::from).collect::<Vec<_>>()
+        };
+        let signet = peers(Network::Signet);
+        let mainnet = peers(Network::Bitcoin);
+        assert!(!mainnet.is_empty());
+        for peer in mainnet {
+            assert!(!signet.iter().any(|other| {
+                peer.get_addrv2() == other.get_addrv2() && peer.get_port() == other.get_port()
+            }));
+        }
+    }
+
+    #[test]
+    fn fixed_endpoints_survive_gossip_and_restart_without_extra_host_identities() {
+        let mut peers = AddressMan::new(None, SUPPORTED_NETWORKS);
+        let host = AddrV2::Ipv4("195.26.240.213".parse().unwrap());
+        peers.add_fixed_addresses(Network::Bitcoin);
+        let ports = |manager: &AddressMan| {
+            let mut ports: Vec<_> = manager
+                .addresses
+                .values()
+                .filter(|a| a.address == host)
+                .map(|a| a.port)
+                .collect();
+            ports.sort();
+            ports
+        };
+        assert_eq!(ports(&peers), [8333, 8433]);
+
+        let core = peers.manual_endpoint(host.clone(), 8333);
+        let bridge = peers.manual_endpoint(host.clone(), 8433);
+        assert_ne!(core.id, bridge.id);
+        peers.update_set_service_flag(
+            core.id,
+            ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+        );
+        peers.update_set_service_flag(
+            bridge.id,
+            ServiceFlags::WITNESS | service_flags::UTREEXO.into(),
+        );
+        let candidates = &peers.peers_by_service[&service_flags::UTREEXO.into()];
+        assert!(candidates.contains(&bridge.id));
+        assert!(!candidates.contains(&core.id));
+
+        let adverts: Vec<_> = (8400..8500)
+            .map(|port| {
+                let mut a = bridge.clone();
+                a.id = rand::random();
+                a.set_port(port);
+                a
+            })
+            .collect();
+        peers.push_addresses(&adverts);
+        peers.add_fixed_addresses(Network::Bitcoin);
+        assert_eq!(ports(&peers), [8333, 8433]);
+        assert_eq!(peers.manual_endpoint(host.clone(), 8433).id, bridge.id);
+
+        let dir =
+            std::env::temp_dir().join(format!("floresta-endpoints-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        peers.dump_peers(path).unwrap();
+        let mut restored = AddressMan::new(None, SUPPORTED_NETWORKS);
+        restored.start_addr_man(path.to_string());
+        assert_eq!(ports(&restored), [8333, 8433]);
+        assert_eq!(restored.manual_endpoint(host.clone(), 8433).id, bridge.id);
+        restored.ban_host(bridge.id, 86400);
+        let until = restored.banned_until(&host).unwrap();
+        assert!(until >= AddressMan::time_since_unix() + 86399);
+        restored.update_set_state(core.id, AddressState::Tried(0));
+        restored.add_fixed_addresses(Network::Bitcoin);
+        assert!(matches!(
+            restored.manual_endpoint(host.clone(), 8333).state,
+            AddressState::Banned(_)
+        ));
+        assert!(matches!(
+            restored.manual_endpoint(host.clone(), 8434).state,
+            AddressState::Banned(_)
+        ));
+        restored.dump_peers(path).unwrap();
+        peers = AddressMan::new(None, SUPPORTED_NETWORKS);
+        peers.start_addr_man(path.to_string());
+        assert_eq!(peers.banned_until(&host), Some(until));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn load_addresses_from_json(file_path: &str) -> io::Result<Vec<LocalAddress>> {
         let mut contents = String::new();
@@ -1542,6 +1843,96 @@ mod test {
             port: 8333,
             id: 0,
         }));
+    }
+
+    #[test]
+    fn proof_only_candidates_survive_gossip_disk_and_service_updates() {
+        let mut addresses = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        let proof = ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into();
+        let raw = ServiceFlags::WITNESS | ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED;
+        let mut bridge = LocalAddress::from(AddrV2::Ipv4("42.43.44.45".parse().unwrap()));
+        bridge.services = proof;
+        bridge.state = AddressState::Tried(AddressMan::time_since_unix());
+        addresses.push_addresses(&[bridge.clone()]);
+        assert_eq!(
+            addresses
+                .get_address_by_service(service_flags::UTREEXO.into())
+                .unwrap()
+                .0,
+            bridge.id
+        );
+        assert!(addresses
+            .get_address_by_service(ServiceFlags::NETWORK)
+            .is_none());
+
+        let restored = LocalAddress::from(DiskLocalAddress::from(bridge.clone()));
+        let mut from_disk = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        from_disk.push_addresses(&[restored]);
+        assert!(from_disk
+            .get_address_by_service(service_flags::UTREEXO.into())
+            .is_some());
+
+        addresses.update_set_service_flag(bridge.id, raw);
+        assert!(addresses
+            .get_address_by_service(service_flags::UTREEXO.into())
+            .is_none());
+        assert_eq!(
+            addresses
+                .get_address_by_service(ServiceFlags::NETWORK)
+                .unwrap()
+                .0,
+            bridge.id
+        );
+        addresses.update_set_service_flag(bridge.id, proof);
+        assert!(addresses
+            .get_address_by_service(ServiceFlags::NETWORK)
+            .is_none());
+        assert_eq!(
+            addresses
+                .get_address_by_service(service_flags::UTREEXO.into())
+                .unwrap()
+                .0,
+            bridge.id
+        );
+        addresses.update_set_service_flag(bridge.id, service_flags::UTREEXO.into());
+        assert!(!addresses.addresses.contains_key(&bridge.id));
+    }
+
+    #[test]
+    fn archive_only_services_do_not_require_a_witness_or_a_block_body() {
+        let archive: ServiceFlags = service_flags::UTREEXO_ARCHIVE.into();
+        let mut addr = LocalAddress::from(AddrV2::Ipv4("42.43.44.47".parse().unwrap()));
+        addr.services = archive;
+        addr.state = AddressState::Tried(AddressMan::time_since_unix());
+        let mut manager = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        manager.push_addresses(&[LocalAddress::from(DiskLocalAddress::from(addr.clone()))]);
+        assert_eq!(manager.get_address_by_service(archive).unwrap().0, addr.id);
+        assert!(manager
+            .get_address_by_service(ServiceFlags::NETWORK)
+            .is_none());
+        assert!(manager
+            .get_address_by_service(service_flags::UTREEXO.into())
+            .is_none());
+        assert!(manager
+            .get_address_to_connect(ServiceFlags::NETWORK, false)
+            .is_none());
+        manager.update_set_service_flag(
+            addr.id,
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::NETWORK_LIMITED,
+        );
+        assert!(manager
+            .get_address_to_connect(service_flags::UTREEXO.into(), false)
+            .is_none());
+        assert!(manager.get_address_to_connect(archive, false).is_none());
+        assert_eq!(
+            manager
+                .get_address_to_connect(ServiceFlags::NETWORK, false)
+                .unwrap()
+                .0,
+            addr.id
+        );
+        manager.update_set_service_flag(addr.id, ServiceFlags::NONE);
+        assert!(manager.get_address_by_service(archive).is_none());
     }
 
     #[test]

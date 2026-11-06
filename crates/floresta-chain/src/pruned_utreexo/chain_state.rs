@@ -167,7 +167,72 @@ pub enum AssumeValidArg {
     UserInput(BlockHash),
 }
 
+/// Whether this build executes scripts using the consensus kernel.
+pub const SCRIPT_KERNEL_ENABLED: bool = cfg!(feature = "bitcoinkernel");
+
+/// A header tip and its active validated height, read under one chainstate lock.
+pub struct ActiveChainStatus {
+    pub height: u32,
+    pub tip: BlockHash,
+    pub validated: u32,
+    pub ibd: bool,
+}
+
 impl<PersistedState: ChainStore> ChainState<PersistedState> {
+    /// Reorganizations update individual disk headers before replacing BestChain.
+    /// During that interval no managed chain or wallet observer can certify a tip.
+    pub fn active_chain_status(&self) -> Result<Option<ActiveChainStatus>, BlockchainError> {
+        Ok(self.active_chain_status_at(None)?.map(|(tip, _)| tip))
+    }
+
+    /// Read the requested historical anchor, active tip and validation index in
+    /// one chainstate observation. The caller rejects a missing or detached pin.
+    pub fn active_chain_status_at(
+        &self,
+        anchor_height: Option<u32>,
+    ) -> Result<Option<(ActiveChainStatus, Option<BlockHash>)>, BlockchainError> {
+        let inner = self.inner.read();
+        let best = &inner.best_block;
+        let stored = inner
+            .chainstore
+            .get_header(&best.validation_index)?
+            .ok_or(BlockchainError::BlockNotPresent)?;
+        let DiskBlockHeader::FullyValid(_, validated) = stored else {
+            return Ok(None);
+        };
+        let tip = if best.best_block == best.validation_index {
+            stored
+        } else {
+            inner
+                .chainstore
+                .get_header(&best.best_block)?
+                .ok_or(BlockchainError::BlockNotPresent)?
+        };
+        if validated > best.depth
+            || matches!(tip, DiskBlockHeader::InFork(_, _))
+            || tip.height() != Some(best.depth)
+            || tip.block_hash() != best.best_block
+            || stored.block_hash() != best.validation_index
+            || inner.chainstore.get_block_hash(validated)? != Some(best.validation_index)
+            || inner.chainstore.get_block_hash(best.depth)? != Some(best.best_block)
+        {
+            return Ok(None);
+        }
+        let anchor = match anchor_height {
+            Some(height) if height <= best.depth => inner.chainstore.get_block_hash(height)?,
+            _ => None,
+        };
+        Ok(Some((
+            ActiveChainStatus {
+                height: best.depth,
+                tip: best.best_block,
+                validated,
+                ibd: inner.ibd,
+            },
+            anchor,
+        )))
+    }
+
     fn maybe_reindex(&self, potential_tip: &DiskBlockHeader) -> Result<(), BlockchainError> {
         if let DiskBlockHeader::HeadersOnly(_, height) = potential_tip {
             let best_height = self.get_best_block()?.0;
@@ -1220,11 +1285,23 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
     }
 
     fn mark_block_as_valid(&self, block: BlockHash) -> Result<(), BlockchainError> {
-        let header = self.get_disk_block_header(&block)?;
+        // The foreground may have moved while a replay was running. Validate and promote
+        // under the same lock so a detached block cannot overwrite the active height.
+        let mut inner = write_lock!(self);
+        let header = inner
+            .chainstore
+            .get_header(&block)?
+            .ok_or(BlockchainError::BlockNotPresent)?;
         let height = header.try_height()?;
-
-        let new_header = DiskBlockHeader::FullyValid(*header, height);
-        self.update_header(&new_header)
+        if inner.chainstore.get_block_hash(height)? != Some(block) {
+            return Err(BlockchainError::OrphanOrInvalidBlock);
+        }
+        if matches!(header, DiskBlockHeader::FullyValid(_, _)) {
+            return Ok(());
+        }
+        Ok(inner
+            .chainstore
+            .save_header(&DiskBlockHeader::FullyValid(*header, height))?)
     }
 
     fn mark_chain_as_assumed(
@@ -1232,7 +1309,8 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         acc: Stump,
         assumed_hash: BlockHash,
     ) -> Result<bool, BlockchainError> {
-        let mut curr_header = self.get_disk_block_header(&assumed_hash)?;
+        let anchor = self.get_disk_block_header(&assumed_hash)?;
+        let mut curr_header = anchor;
 
         while let Ok(header) = self.get_disk_block_header(&curr_header.block_hash()) {
             if self.is_genesis(&header) {
@@ -1244,11 +1322,9 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             curr_header = self.get_ancestor(&header)?;
         }
 
-        self.update_view(curr_header.try_height()?, &curr_header, acc.clone())?;
-
-        let mut guard = write_lock!(self);
-        guard.best_block.validation_index = assumed_hash;
-        guard.acc = acc;
+        // Persist the assumed accumulator at its actual block, so startup can reload
+        // the same stump even if the node exits before the next block arrives.
+        self.update_view(anchor.try_height()?, &anchor, acc)?;
 
         Ok(true)
     }
@@ -1272,6 +1348,32 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             height - 1,
         );
         Ok(())
+    }
+
+    fn verified_descendant(
+        &self,
+        ancestor: (u32, BlockHash),
+    ) -> Result<Option<(u32, BlockHash, Stump)>, BlockchainError> {
+        let inner = self.inner.read();
+        let best = &inner.best_block;
+        if !SCRIPT_KERNEL_ENABLED
+            || inner.assume_valid.is_some()
+            || inner.ibd
+            || best.validation_index != best.best_block
+            || ancestor.0 > best.depth
+            || inner.chainstore.get_block_hash(ancestor.0)? != Some(ancestor.1)
+            || inner.chainstore.get_block_hash(best.depth)? != Some(best.best_block)
+        {
+            return Ok(None);
+        }
+        match inner.chainstore.get_header(&best.best_block)? {
+            Some(DiskBlockHeader::FullyValid(header, height))
+                if height == best.depth && header.block_hash() == best.best_block =>
+            {
+                Ok(Some((height, best.best_block, inner.acc.clone())))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn toggle_ibd(&self, is_ibd: bool) {
@@ -1429,16 +1531,15 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         final_height: u32,
         acc: Stump,
     ) -> Result<super::partial_chain::PartialChainState, BlockchainError> {
+        if initial_height > final_height {
+            return Err(BlockchainError::BadValidationIndex);
+        }
         let blocks = (0..=final_height)
             .map(|height| {
-                let hash = self
-                    .get_block_hash(height)
-                    .expect("Block should be present");
-                *self
-                    .get_disk_block_header(&hash)
-                    .expect("Block should be present")
+                let hash = self.get_block_hash(height)?;
+                self.get_disk_block_header(&hash).map(|header| *header)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let inner = PartialChainStateInner {
             error: None,
@@ -1689,6 +1790,73 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "bitcoinkernel")]
+    fn verified_descendant_requires_active_ancestor_current_tip_and_full_script_policy() {
+        let mut blocks = include_str!("../../testdata/blocks.txt")
+            .lines()
+            .map(|s| deserialize_hex::<Block>(s).unwrap());
+        let genesis = blocks.next().unwrap().block_hash();
+        let block = blocks.next().unwrap();
+        let next = blocks.next().unwrap();
+        for policy in [
+            AssumeValidArg::Disabled,
+            AssumeValidArg::UserInput(block.block_hash()),
+        ] {
+            let chain = setup_test_chain(Network::Regtest, policy);
+            chain.accept_header(block.header).unwrap();
+            chain
+                .connect_block(&block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+            chain.toggle_ibd(false);
+            let sealed = chain.verified_descendant((0, genesis)).unwrap();
+            if matches!(policy, AssumeValidArg::UserInput(_)) {
+                assert!(sealed.is_none());
+                continue;
+            }
+            assert_eq!(sealed, Some((1, block.block_hash(), chain.acc())));
+            assert!(chain.verified_descendant((1, genesis)).unwrap().is_none());
+            chain.toggle_ibd(true);
+            assert!(chain.verified_descendant((0, genesis)).unwrap().is_none());
+            chain.toggle_ibd(false);
+            chain.accept_header(next.header).unwrap();
+            assert!(chain.verified_descendant((0, genesis)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn replay_preserves_persisted_stump_at_the_selected_block() {
+        let mut parsed = include_str!("../../testdata/blocks.txt")
+            .lines()
+            .map(|line| deserialize_hex::<Block>(line).unwrap());
+        let _genesis = parsed.next().unwrap();
+        let block = parsed.next().unwrap();
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled);
+        chain.accept_header(block.header).unwrap();
+        chain
+            .connect_block(&block, Proof::default(), HashMap::new(), Vec::new())
+            .unwrap();
+        let expected = chain.acc();
+        assert_ne!(expected, Stump::default());
+        chain.mark_block_as_valid(block.block_hash()).unwrap();
+        assert_eq!(
+            chain.get_roots_for_block(1).unwrap(),
+            Some(expected.clone())
+        );
+
+        let assumed = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled);
+        assumed.accept_header(block.header).unwrap();
+        assumed
+            .mark_chain_as_assumed(expected.clone(), block.block_hash())
+            .unwrap();
+        assert_eq!(assumed.get_validation_index().unwrap(), 1);
+        assert_eq!(assumed.get_roots_for_block(1).unwrap(), Some(expected));
+        assert_eq!(
+            assumed.get_roots_for_block(0).unwrap().unwrap_or_default(),
+            Stump::default()
+        );
+    }
+
+    #[test]
     fn test_calc_next_work_required() {
         let first_block: BlockHeader = deserialize_hex("0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a008f4d5fae77031e8ad22203").unwrap();
         let last_block: BlockHeader = deserialize_hex("00000020dec6741f7dc5df6661bcb2d3ec2fceb14bd0e6def3db80da904ed1eeb8000000d1f308132e6a72852c04b059e92928ea891ae6d513cd3e67436f908c804ec7be51df535fae77031e4d00f800").unwrap();
@@ -1700,6 +1868,74 @@ mod test {
         );
 
         assert_eq!(0x1e012fa7, next_target.to_compact_lossy().to_consensus());
+    }
+
+    #[test]
+    fn active_chain_status_retries_a_reorg_between_disk_and_tip_updates() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled);
+        let source: Vec<Vec<&str>> =
+            serde_json::from_str(include_str!("../../testdata/test_reorg.json")).unwrap();
+        let decode = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|b| deserialize_hex(b).unwrap())
+                .collect::<Vec<Block>>()
+        };
+        let original = decode(&source[0]);
+        let fork = decode(&source[1]);
+        for b in &original {
+            chain.accept_header(b.header).unwrap();
+            chain
+                .connect_block(b, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+        for b in &fork[..5] {
+            chain.accept_header(b.header).unwrap();
+        }
+        let status = chain.active_chain_status().unwrap().unwrap();
+        assert_eq!(
+            (status.height, status.validated, status.tip),
+            (10, 10, original[9].block_hash())
+        );
+
+        // Reproduce a real reader between the steps of ChainState::reorg.
+        chain
+            .mark_chain_as_inactive(&original[9].header, original[4].block_hash())
+            .unwrap();
+        assert!(matches!(
+            chain.get_validation_index(),
+            Err(BlockchainError::BadValidationIndex)
+        ));
+        assert!(chain.active_chain_status().unwrap().is_none());
+        assert!(chain.active_chain_status_at(Some(5)).unwrap().is_none());
+
+        chain.switch_chain(fork[4].block_hash()).unwrap();
+        let (competing, checkpoint) = chain.active_chain_status_at(Some(10)).unwrap().unwrap();
+        assert_eq!(competing.tip, fork[4].block_hash());
+        assert_eq!(checkpoint, Some(competing.tip));
+        assert_ne!(checkpoint, Some(original[9].block_hash()));
+        let status = chain.active_chain_status().unwrap().unwrap();
+        assert_eq!(
+            (status.height, status.validated, status.tip),
+            (10, 5, fork[4].block_hash())
+        );
+
+        #[cfg(feature = "bitcoinkernel")]
+        {
+            chain.toggle_ibd(false);
+            for block in &fork[..5] {
+                chain
+                    .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                    .unwrap();
+            }
+            let detached = (10, original[9].block_hash());
+            let common = (5, original[4].block_hash());
+            assert!(chain.verified_descendant(detached).unwrap().is_none());
+            assert_eq!(
+                chain.verified_descendant(common).unwrap(),
+                Some((10, fork[4].block_hash(), chain.acc()))
+            );
+        }
     }
 
     #[test]
