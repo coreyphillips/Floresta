@@ -529,21 +529,25 @@ where
             let default_port = Self::get_port(network);
             let dns_seeds = floresta_chain::get_chain_dns_seeds(network);
 
-            let mut addresses = Vec::new();
+            // Publish each seed promptly so a slow unrelated resolver cannot hold
+            // an already resolved proof source until the entire seed list finishes.
             for seed in &dns_seeds {
-                if let Ok(got) = AddressMan::get_seeds_from_dns(seed, default_port, proxy_addr) {
-                    addresses.extend(got);
+                if let Ok(addresses) =
+                    AddressMan::get_seeds_from_dns(seed, default_port, proxy_addr)
+                {
+                    info!(
+                        "Fetched {} peer addresses from DNS seed {}",
+                        addresses.len(),
+                        seed.seed
+                    );
+                    if node_sender
+                        .send(NodeNotification::DnsSeedAddresses(addresses))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
-
-            info!(
-                "Fetched {} peer addresses from all DNS seeds",
-                addresses.len()
-            );
-
-            node_sender
-                .send(NodeNotification::DnsSeedAddresses(addresses))
-                .unwrap();
         });
 
         Ok(())
@@ -552,13 +556,23 @@ where
     /// Check whether it's necessary to request more addresses from DNS seeds.
     ///
     /// Perform another address request from DNS seeds if we still don't have enough addresses
-    /// on the [`AddressMan`] and the last address request from DNS seeds was over 2 minutes ago.
+    /// on the [`AddressMan`] or a connected historical proof provider, subject to the
+    /// existing hourly DNS request interval.
     fn maybe_ask_dns_seed_for_addresses(&mut self) {
         let enough_addresses = self.address_man.enough_addresses();
 
-        // Skip if address fetching from DNS seeds is disabled,
-        // or if the [`AddressMan`] has enough addresses in its database.
-        if self.config.disable_dns_seeds || enough_addresses {
+        // Address hints do not establish a live provider of historical proofs.
+        // Retry even with a full address book while historical synchronization
+        // lacks the required service. The existing interval bounds DNS traffic.
+        let historical_gap = self
+            .chain
+            .get_best_block()
+            .map(|best| best.0)
+            .unwrap_or_default()
+            .saturating_sub(self.chain.get_validation_index().unwrap_or_default());
+        let needs_archive =
+            (self.historical_replay || historical_gap >= 288) && !self.has_historical_proof_peer();
+        if self.config.disable_dns_seeds || (enough_addresses && !needs_archive) {
             return;
         }
 

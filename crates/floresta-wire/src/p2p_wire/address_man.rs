@@ -642,13 +642,22 @@ impl AddressMan {
         default_port: u16,
         socks5: Option<SocketAddr>,
     ) -> Result<Vec<LocalAddress>, std::io::Error> {
+        Ok(Self::get_seeds_with_lookup(seed, |host| {
+            Self::do_lookup(host, default_port, socks5)
+        }))
+    }
+
+    fn get_seeds_with_lookup(
+        seed: &DnsSeed,
+        mut lookup: impl FnMut(&str) -> Vec<LocalAddress>,
+    ) -> Vec<LocalAddress> {
         let mut addresses = Vec::new();
         let now = Self::time_since_unix();
 
         // ask for utreexo peers (if filtering is available)
         if seed.filters.has(service_flags::UTREEXO.into()) {
             let host = format!("x1000.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
+            let _addresses = lookup(&host);
             let _addresses = _addresses.into_iter().map(|mut x| {
                 x.services = ServiceFlags::NETWORK_LIMITED
                     | service_flags::UTREEXO.into()
@@ -663,7 +672,7 @@ impl AddressMan {
         // ask for compact filter peers (if filtering is available)
         if seed.filters.has(ServiceFlags::COMPACT_FILTERS) {
             let host = format!("x49.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
+            let _addresses = lookup(&host);
             let _addresses = _addresses.into_iter().map(|mut x| {
                 x.services = ServiceFlags::COMPACT_FILTERS
                     | ServiceFlags::NETWORK_LIMITED
@@ -678,7 +687,7 @@ impl AddressMan {
         // ask for any peer (if filtering is available)
         if seed.filters.has(ServiceFlags::WITNESS) {
             let host = format!("x9.{}", seed.seed);
-            let _addresses = Self::do_lookup(&host, default_port, socks5);
+            let _addresses = lookup(&host);
             let _addresses = _addresses.into_iter().map(|mut x| {
                 x.services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
                 x.state = AddressState::Tried(now);
@@ -690,9 +699,9 @@ impl AddressMan {
 
         // ask for any peer (if filtering isn't available)
         if seed.filters == ServiceFlags::NONE {
-            let _addresses = Self::do_lookup(seed.seed, default_port, socks5);
+            let _addresses = lookup(seed.seed);
             let _addresses = _addresses.into_iter().map(|mut x| {
-                x.services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+                x.services = seed.unfiltered_services;
                 x.state = AddressState::Tried(now);
                 x
             });
@@ -700,7 +709,7 @@ impl AddressMan {
             addresses.extend(_addresses);
         }
 
-        Ok(addresses)
+        addresses
     }
 
     /// Returns a new random address to open a new connection, we try to get addresses with
@@ -1294,6 +1303,59 @@ mod test {
     use crate::address_man::DiskLocalAddress;
     use crate::address_man::ReachableNetworks;
     use crate::address_man::SUPPORTED_NETWORKS;
+
+    #[test]
+    fn unfiltered_utreexo_seed_is_queried_bare_and_selected_for_proofs() {
+        let seeds = get_chain_dns_seeds(Network::Bitcoin);
+        let seed = seeds
+            .iter()
+            .find(|seed| seed.seed == "manualseed.calvinkim.info")
+            .unwrap();
+        let mut queried = Vec::new();
+        let addresses = AddressMan::get_seeds_with_lookup(seed, |host| {
+            queried.push(host.to_owned());
+            vec![LocalAddress::try_from("8.8.8.8:8333").unwrap()]
+        });
+        assert_eq!(queried, ["manualseed.calvinkim.info"]);
+        assert_eq!(addresses.len(), 1);
+        assert!(addresses[0].services.has(service_flags::UTREEXO.into()));
+        assert!(addresses[0]
+            .services
+            .has(service_flags::UTREEXO_ARCHIVE.into()));
+        let mut manager = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        manager.push_addresses(&addresses);
+        assert!(manager
+            .get_address_to_connect(service_flags::UTREEXO_ARCHIVE.into(), false)
+            .is_some());
+        let recent_only =
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | service_flags::UTREEXO.into();
+        manager.update_set_service_flag(addresses[0].id, recent_only);
+        assert!(manager
+            .get_address_by_service(service_flags::UTREEXO_ARCHIVE.into())
+            .is_none());
+        assert_eq!(
+            manager
+                .get_address_by_service(service_flags::UTREEXO.into())
+                .unwrap()
+                .0,
+            addresses[0].id
+        );
+    }
+
+    #[test]
+    fn ordinary_unfiltered_seed_keeps_ordinary_candidate_services() {
+        let seed =
+            floresta_chain::DnsSeed::new(Network::Testnet, "ordinary.example", ServiceFlags::NONE);
+        let addresses = AddressMan::get_seeds_with_lookup(&seed, |host| {
+            assert_eq!(host, "ordinary.example");
+            vec![LocalAddress::try_from("8.8.8.8:18333").unwrap()]
+        });
+        assert_eq!(
+            addresses[0].services,
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS
+        );
+        assert!(AddressMan::get_seeds_with_lookup(&seed, |_| Vec::new()).is_empty());
+    }
 
     #[test]
     fn mainnet_and_signet_fixed_seeds_are_separate() {
