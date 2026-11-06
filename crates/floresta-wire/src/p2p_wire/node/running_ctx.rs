@@ -269,7 +269,7 @@ where
             self.mempool.clone(),
             None,
             self.kill_signal.clone(),
-            self.address_man.clone(),
+            self.address_man.clone_for_new_node(),
         )?;
         node.historical_replay = true;
         node.context.replay = Some((checkpoint.clone(), status.clone(), height));
@@ -389,7 +389,7 @@ where
             self.mempool.clone(),
             None,
             self.kill_signal.clone(),
-            self.address_man.clone(),
+            self.address_man.clone_for_new_node(),
         )
         .unwrap();
 

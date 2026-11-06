@@ -380,6 +380,18 @@ impl AddressMan {
         }
     }
 
+    /// Copy known addresses for a node with its own, initially empty connection set.
+    /// Connections belong to the source node, while bans and retry cooldowns remain shared history.
+    pub(crate) fn clone_for_new_node(&self) -> Self {
+        let mut addresses = self.clone();
+        for address in addresses.addresses.values_mut() {
+            if address.state == AddressState::Connected {
+                address.state = AddressState::Tried(address.last_connected);
+            }
+        }
+        addresses
+    }
+
     /// Returns the current timestamp since the epoch
     fn time_since_unix() -> u64 {
         SystemTime::now()
@@ -1339,6 +1351,77 @@ mod test {
                 .unwrap()
                 .0,
             addresses[0].id
+        );
+    }
+
+    #[test]
+    fn independent_node_can_select_connected_archives_without_clearing_peer_history() {
+        let archive: ServiceFlags = service_flags::UTREEXO_ARCHIVE.into();
+        let body = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::NETWORK_LIMITED;
+        let mut source = AddressMan::new(Some(20), &[ReachableNetworks::IPv4]);
+        let host = AddrV2::Ipv4("8.8.8.8".parse().unwrap());
+        let core = source.manual_endpoint(host.clone(), 8333);
+        let bridge = source.manual_endpoint(host.clone(), 8335);
+        let banned = source.manual_endpoint(AddrV2::Ipv4("8.8.4.4".parse().unwrap()), 8335);
+        let failed = source.manual_endpoint(AddrV2::Ipv4("1.1.1.1".parse().unwrap()), 8335);
+        let untried = source.manual_endpoint(AddrV2::Ipv4("9.9.9.9".parse().unwrap()), 8333);
+        let tried = source.manual_endpoint(AddrV2::Ipv4("4.2.2.2".parse().unwrap()), 8333);
+        for peer in [&bridge, &banned, &failed] {
+            source.update_set_service_flag(peer.id, archive);
+        }
+        for peer in [&core, &untried, &tried] {
+            source.update_set_service_flag(peer.id, body);
+        }
+        let now = AddressMan::time_since_unix();
+        source.update_set_state(core.id, AddressState::Connected);
+        source.update_set_state(bridge.id, AddressState::Connected);
+        source.ban_host(banned.id, 86400);
+        source.update_set_state(failed.id, AddressState::Failed(now));
+        source.update_set_state(tried.id, AddressState::Tried(now - 10));
+        let original = source.clone();
+        let mut ordinary = source.clone();
+        assert!(source.get_address_to_connect(archive, false).is_none());
+        assert!(ordinary.get_address_to_connect(archive, false).is_none());
+
+        let mut independent = source.clone_for_new_node();
+        let (id, selected) = independent.get_address_to_connect(archive, false).unwrap();
+        assert_eq!(independent.max_size, source.max_size);
+        assert_eq!(independent.reachable_networks, source.reachable_networks);
+        assert_eq!(independent.good_addresses, source.good_addresses);
+        assert_eq!(
+            independent.good_peers_by_service,
+            source.good_peers_by_service
+        );
+        assert_eq!(independent.peers_by_service, source.peers_by_service);
+        assert_eq!(independent.addresses.len(), source.addresses.len());
+        for (id, address) in &source.addresses {
+            let mut expected = address.clone();
+            if expected.state == AddressState::Connected {
+                expected.state = AddressState::Tried(expected.last_connected);
+            }
+            assert_eq!(independent.addresses[id], expected);
+        }
+        assert_eq!(id, bridge.id);
+        assert_eq!(selected.address, host);
+        assert_eq!(selected.port, 8335);
+        assert_eq!(selected.services, archive);
+        assert_eq!(independent.manual_endpoint(host.clone(), 8333).id, core.id);
+        assert_eq!(independent.manual_endpoint(host, 8335).id, bridge.id);
+        assert_eq!(source.addresses, original.addresses);
+        assert_eq!(ordinary.addresses, original.addresses);
+        assert_eq!(source.addresses[&bridge.id].state, AddressState::Connected);
+
+        // Once the independent archive connection is also occupied, neither the
+        // banned archive nor the archive in its failure cooldown becomes eligible.
+        independent.update_set_state(bridge.id, AddressState::Connected);
+        assert!(independent.get_address_to_connect(archive, false).is_none());
+        assert_eq!(
+            independent.addresses[&banned.id],
+            original.addresses[&banned.id]
+        );
+        assert_eq!(
+            independent.addresses[&failed.id],
+            original.addresses[&failed.id]
         );
     }
 
